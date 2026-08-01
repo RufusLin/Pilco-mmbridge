@@ -1,0 +1,367 @@
+from __future__ import annotations
+
+import copy
+import json
+import logging
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+
+import httpx
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, Response
+
+from .cache import AnalysisCache, make_cache_key
+from .config import Settings
+from .media import find_media_items
+from .prompting import (
+    build_analyzer_body,
+    extract_text_from_upstream_response,
+    extract_user_request_text,
+    inject_analysis,
+    rewrite_model,
+)
+from .security import assert_body_size, check_client_auth
+from .upstream import (
+    UpstreamResult,
+    build_upstream_url,
+    make_response,
+    prepare_headers,
+    request_bytes,
+    stream_upstream,
+)
+
+logger = logging.getLogger("mm_bridge")
+
+
+def create_app(settings: Settings) -> FastAPI:
+    app = FastAPI(title="MM Bridge Official Transparent Proxy", version="2.0.0")
+    timeout = httpx.Timeout(settings.http_timeout_seconds, connect=min(30.0, settings.http_timeout_seconds))
+    client = httpx.AsyncClient(timeout=timeout, follow_redirects=False)
+    cache = AnalysisCache(settings.analyzer_cache_dir)
+
+    app.state.settings = settings
+    app.state.http_client = client
+    app.state.cache = cache
+
+    @app.on_event("shutdown")
+    async def _shutdown() -> None:
+        await client.aclose()
+
+    @app.get("/health")
+    async def health() -> dict[str, Any]:
+        return {
+            "ok": True,
+            "mode": "official-transparent-media-enrich",
+            "port": settings.bridge_port,
+            "vllm_root_url": settings.vllm_root_url,
+            "llama_root_url": settings.llama_root_url,
+            "bridge_model_id": settings.bridge_model_id,
+            "vllm_media_policy": settings.vllm_media_policy,
+            "analyzer_endpoints": settings.analyzer_endpoints,
+            "stream_heartbeat_seconds": settings.stream_heartbeat_seconds,
+        }
+
+    @app.api_route("/v1/models", methods=["GET"])
+    async def models(request: Request) -> Response:
+        check_client_auth(request, settings)
+        request_id = _request_id(request)
+        if settings.models_policy == "passthrough":
+            return await _forward_raw(request, settings, client, request_id, stage="vllm_models")
+        return await _models_response(request, settings, client, request_id)
+
+    @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
+    async def transparent(path: str, request: Request) -> Response:
+        check_client_auth(request, settings)
+        request_id = _request_id(request)
+        started = time.perf_counter()
+        endpoint = "/" + path
+        body_bytes = await request.body()
+        assert_body_size(body_bytes, settings)
+
+        if request.method.upper() != "POST" or not _looks_json(request, body_bytes):
+            logger.info("request_id=%s direct method=%s path=%s bytes=%s", request_id, request.method, endpoint, len(body_bytes))
+            return await _forward_raw(request, settings, client, request_id, stage="vllm_direct", body_bytes=body_bytes)
+
+        try:
+            body = json.loads(body_bytes.decode("utf-8"))
+        except Exception:
+            logger.info("request_id=%s direct non_json path=%s bytes=%s", request_id, endpoint, len(body_bytes))
+            return await _forward_raw(request, settings, client, request_id, stage="vllm_direct", body_bytes=body_bytes)
+
+        if not isinstance(body, dict):
+            return await _forward_raw(request, settings, client, request_id, stage="vllm_direct", body_bytes=body_bytes)
+
+        media_items = find_media_items(body)
+        if len(media_items) > settings.max_media_items:
+            raise HTTPException(
+                status_code=413,
+                detail={
+                    "error": "too_many_media_items",
+                    "media_items": len(media_items),
+                    "max_media_items": settings.max_media_items,
+                    "request_id": request_id,
+                },
+            )
+        for item in media_items:
+            if item.approx_bytes > settings.max_media_bytes:
+                raise HTTPException(
+                    status_code=413,
+                    detail={
+                        "error": "media_item_too_large",
+                        "media_index": item.index,
+                        "approx_bytes": item.approx_bytes,
+                        "max_media_bytes": settings.max_media_bytes,
+                        "request_id": request_id,
+                    },
+                )
+
+        if not media_items:
+            final_body = rewrite_model(body, await _vllm_model(settings, client), settings.bridge_model_id, settings.rewrite_bridge_model_only)
+            final_bytes = _json_bytes(final_body)
+            _debug_dump(settings, request_id, "incoming_direct.json", body)
+            logger.info("request_id=%s vllm_direct path=%s media=0 bytes=%s", request_id, endpoint, len(final_bytes))
+            return await _forward_json_to_vllm(request, settings, client, request_id, final_bytes, stage="vllm_direct")
+
+        normalized_endpoint = endpoint.rstrip("/")
+        if normalized_endpoint not in {p.rstrip("/") for p in settings.analyzer_endpoints}:
+            msg = f"media detected but endpoint {endpoint} is not in MM_ANALYZER_ENDPOINTS; official analyzer enrichment skipped"
+            logger.warning("request_id=%s %s", request_id, msg)
+            if settings.unsupported_media_endpoint_policy == "error":
+                return JSONResponse(
+                    {
+                        "error": {
+                            "stage": "bridge_protocol_gate",
+                            "message": msg,
+                            "request_id": request_id,
+                            "supported_analyzer_endpoints": settings.analyzer_endpoints,
+                        }
+                    },
+                    status_code=501,
+                )
+            final_body = rewrite_model(body, await _vllm_model(settings, client), settings.bridge_model_id, settings.rewrite_bridge_model_only)
+            return await _forward_json_to_vllm(request, settings, client, request_id, _json_bytes(final_body), stage="vllm_passthrough_media_unsupported_endpoint")
+
+        logger.info(
+            "request_id=%s media_detected path=%s media_count=%s policy=%s",
+            request_id,
+            endpoint,
+            len(media_items),
+            settings.vllm_media_policy,
+        )
+        _debug_dump(settings, request_id, "incoming.json", body)
+
+        llama_model = await _llama_model(settings, client)
+        user_request_text = extract_user_request_text(body, normalized_endpoint)
+        cache_key = make_cache_key(normalized_endpoint, llama_model, media_items, user_request_text)
+        analysis_text = cache.get(cache_key) if settings.analyzer_cache else None
+        if analysis_text:
+            logger.info("request_id=%s analyzer_cache_hit key=%s", request_id, cache_key[:16])
+        else:
+            analyzer_body = build_analyzer_body(body, normalized_endpoint, media_items, settings, llama_model)
+            _debug_dump(settings, request_id, "llama_request.json", analyzer_body)
+            analyzer_result = await _call_llama_analyzer(request, settings, client, request_id, endpoint, analyzer_body)
+            _debug_dump_bytes(settings, request_id, "llama_response.body", analyzer_result.body)
+            if not analyzer_result.ok:
+                logger.error(
+                    "request_id=%s llama_analyzer_failed path=%s status=%s body=%s",
+                    request_id,
+                    endpoint,
+                    analyzer_result.status_code,
+                    analyzer_result.text()[:1000],
+                )
+                if settings.fail_on_analyzer_error:
+                    return JSONResponse(
+                        {
+                            "error": {
+                                "stage": "llama_analyzer",
+                                "upstream_url": analyzer_result.url,
+                                "method": request.method,
+                                "path": endpoint,
+                                "status_code": analyzer_result.status_code,
+                                "body": analyzer_result.text(),
+                                "request_id": request_id,
+                            }
+                        },
+                        status_code=analyzer_result.status_code,
+                        headers={"x-mm-bridge-stage": "llama_analyzer", "x-mm-bridge-request-id": request_id},
+                    )
+                # Optional fail-open: final vLLM receives original request.
+                analysis_text = ""
+            else:
+                analysis_payload = analyzer_result.json()
+                analysis_text = extract_text_from_upstream_response(normalized_endpoint, analysis_payload)
+                if settings.analyzer_cache:
+                    cache.set(cache_key, analysis_text, {"endpoint": normalized_endpoint, "model": llama_model})
+
+        final_body = inject_analysis(body, normalized_endpoint, analysis_text or "", settings)
+        final_body = rewrite_model(final_body, await _vllm_model(settings, client), settings.bridge_model_id, settings.rewrite_bridge_model_only)
+        _debug_dump(settings, request_id, "vllm_request.json", final_body)
+        final_bytes = _json_bytes(final_body)
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        logger.info("request_id=%s vllm_final path=%s bytes=%s elapsed_before_vllm_ms=%s", request_id, endpoint, len(final_bytes), elapsed_ms)
+        return await _forward_json_to_vllm(request, settings, client, request_id, final_bytes, stage="vllm_final")
+
+    return app
+
+
+async def _models_response(request: Request, settings: Settings, client: httpx.AsyncClient, request_id: str) -> Response:
+    upstream_data: list[dict[str, Any]] = []
+    upstream_status = 200
+    if settings.models_policy in {"alias_plus_upstream", "upstream_only"}:
+        url = build_upstream_url(settings.vllm_root_url, "/v1/models", request.url.query)
+        headers = prepare_headers(request, settings.vllm_api_key, settings.vllm_auth_style, "/v1/models", request_id)
+        try:
+            result = await request_bytes(client, "GET", url, headers, b"")
+            upstream_status = result.status_code
+            if result.ok:
+                payload = result.json()
+                if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+                    upstream_data = [x for x in payload["data"] if isinstance(x, dict)]
+            elif settings.models_policy == "upstream_only":
+                return make_response(result, "vllm_models", request_id, settings)
+        except Exception as exc:
+            if settings.models_policy == "upstream_only":
+                raise
+            logger.warning("request_id=%s model_discovery_failed error=%s", request_id, exc)
+
+    if settings.models_policy == "upstream_only":
+        return JSONResponse({"object": "list", "data": upstream_data}, headers={"x-mm-bridge-request-id": request_id})
+
+    alias = {
+        "id": settings.bridge_model_id,
+        "object": "model",
+        "created": 0,
+        "owned_by": "mm-bridge",
+    }
+    if settings.models_policy == "alias_only":
+        data = [alias]
+    else:
+        existing = {item.get("id") for item in upstream_data}
+        data = ([alias] if settings.bridge_model_id not in existing else []) + upstream_data
+    return JSONResponse({"object": "list", "data": data}, headers={"x-mm-bridge-request-id": request_id, "x-mm-bridge-stage": "bridge_models"})
+
+
+async def _forward_raw(
+    request: Request,
+    settings: Settings,
+    client: httpx.AsyncClient,
+    request_id: str,
+    stage: str,
+    body_bytes: bytes | None = None,
+) -> Response:
+    if body_bytes is None:
+        body_bytes = await request.body()
+    endpoint = request.url.path
+    url = build_upstream_url(settings.vllm_root_url, endpoint, request.url.query)
+    headers = prepare_headers(request, settings.vllm_api_key, settings.vllm_auth_style, endpoint, request_id)
+    result = await request_bytes(client, request.method, url, headers, body_bytes)
+    return make_response(result, stage, request_id, settings)
+
+
+async def _forward_json_to_vllm(
+    request: Request,
+    settings: Settings,
+    client: httpx.AsyncClient,
+    request_id: str,
+    body_bytes: bytes,
+    stage: str,
+) -> Response:
+    endpoint = request.url.path
+    url = build_upstream_url(settings.vllm_root_url, endpoint, request.url.query)
+    headers = prepare_headers(request, settings.vllm_api_key, settings.vllm_auth_style, endpoint, request_id)
+    headers["content-type"] = "application/json"
+    # Preserve official streaming behavior for the final upstream only.
+    if _body_requests_stream(body_bytes):
+        return await stream_upstream(client, request.method, url, headers, body_bytes, stage, request_id, heartbeat_seconds=settings.stream_heartbeat_seconds)
+    result = await request_bytes(client, request.method, url, headers, body_bytes)
+    return make_response(result, stage, request_id, settings)
+
+
+async def _call_llama_analyzer(
+    request: Request,
+    settings: Settings,
+    client: httpx.AsyncClient,
+    request_id: str,
+    endpoint: str,
+    analyzer_body: dict[str, Any],
+) -> UpstreamResult:
+    body_bytes = _json_bytes(analyzer_body)
+    url = build_upstream_url(settings.llama_root_url, endpoint, request.url.query)
+    headers = prepare_headers(request, settings.llama_api_key, settings.llama_auth_style, endpoint, request_id)
+    headers["content-type"] = "application/json"
+    return await request_bytes(client, request.method, url, headers, body_bytes)
+
+
+async def _discover_first_model(root_url: str, api_key: str, auth_style: str, client: httpx.AsyncClient, endpoint: str = "/v1/models") -> str:
+    headers: dict[str, str] = {}
+    from .upstream import add_upstream_auth
+
+    add_upstream_auth(headers, api_key, auth_style, endpoint)  # type: ignore[arg-type]
+    url = build_upstream_url(root_url, endpoint, "")
+    resp = await client.get(url, headers=headers)
+    resp.raise_for_status()
+    payload = resp.json()
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if isinstance(data, list) and data and isinstance(data[0], dict) and data[0].get("id"):
+        return str(data[0]["id"])
+    raise RuntimeError(f"Could not discover model from {url}")
+
+
+async def _vllm_model(settings: Settings, client: httpx.AsyncClient) -> str:
+    if settings.vllm_model:
+        return settings.vllm_model
+    if not hasattr(client, "_mm_bridge_vllm_model"):
+        setattr(client, "_mm_bridge_vllm_model", await _discover_first_model(settings.vllm_root_url, settings.vllm_api_key, settings.vllm_auth_style, client))
+    return getattr(client, "_mm_bridge_vllm_model")
+
+
+async def _llama_model(settings: Settings, client: httpx.AsyncClient) -> str:
+    if settings.llama_model:
+        return settings.llama_model
+    if not hasattr(client, "_mm_bridge_llama_model"):
+        setattr(client, "_mm_bridge_llama_model", await _discover_first_model(settings.llama_root_url, settings.llama_api_key, settings.llama_auth_style, client))
+    return getattr(client, "_mm_bridge_llama_model")
+
+
+def _request_id(request: Request) -> str:
+    return request.headers.get("x-request-id") or request.headers.get("x-mm-bridge-request-id") or uuid.uuid4().hex[:16]
+
+
+def _json_bytes(value: Any) -> bytes:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _looks_json(request: Request, body: bytes) -> bool:
+    content_type = request.headers.get("content-type", "").lower()
+    if "json" in content_type:
+        return True
+    stripped = body.lstrip()
+    return stripped.startswith(b"{") or stripped.startswith(b"[")
+
+
+def _body_requests_stream(body: bytes) -> bool:
+    try:
+        payload = json.loads(body.decode("utf-8"))
+        return isinstance(payload, dict) and payload.get("stream") is True
+    except Exception:
+        return False
+
+
+def _debug_dump(settings: Settings, request_id: str, name: str, payload: Any) -> None:
+    if not settings.debug_dump:
+        return
+    root = Path(settings.debug_dump_dir) / request_id
+    root.mkdir(parents=True, exist_ok=True)
+    with (root / name).open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def _debug_dump_bytes(settings: Settings, request_id: str, name: str, payload: bytes) -> None:
+    if not settings.debug_dump:
+        return
+    root = Path(settings.debug_dump_dir) / request_id
+    root.mkdir(parents=True, exist_ok=True)
+    with (root / name).open("wb") as f:
+        f.write(payload)
