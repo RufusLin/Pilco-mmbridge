@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse, Response
 
 from .cache import AnalysisCache, make_cache_key
 from .config import Settings
-from .media import find_media_items
+from .media import find_media_items, replace_or_strip_media_blocks
 from .prompting import (
     build_analyzer_body,
     extract_text_from_upstream_response,
@@ -93,7 +93,8 @@ def create_app(settings: Settings) -> FastAPI:
         if not isinstance(body, dict):
             return await _forward_raw(request, settings, client, request_id, stage="vllm_direct", body_bytes=body_bytes)
 
-        media_items = find_media_items(body)
+        current_user_content = _latest_user_content(body, endpoint)
+        media_items = find_media_items(current_user_content)
         if len(media_items) > settings.max_media_items:
             raise HTTPException(
                 status_code=413,
@@ -118,7 +119,8 @@ def create_app(settings: Settings) -> FastAPI:
                 )
 
         if not media_items:
-            final_body = rewrite_model(body, await _vllm_model(settings, client), settings.bridge_model_id, settings.rewrite_bridge_model_only)
+            final_body = replace_or_strip_media_blocks(body, "strip")
+            final_body = rewrite_model(final_body, await _vllm_model(settings, client), settings.bridge_model_id, settings.rewrite_bridge_model_only)
             final_bytes = _json_bytes(final_body)
             _debug_dump(settings, request_id, "incoming_direct.json", body)
             logger.info("request_id=%s vllm_direct path=%s media=0 bytes=%s", request_id, endpoint, len(final_bytes))
@@ -339,6 +341,28 @@ def _looks_json(request: Request, body: bytes) -> bool:
         return True
     stripped = body.lstrip()
     return stripped.startswith(b"{") or stripped.startswith(b"[")
+
+
+def _latest_user_content(body: dict[str, Any], endpoint: str) -> Any:
+    endpoint = endpoint.rstrip("/")
+
+    if endpoint in {"/v1/chat/completions", "/v1/messages"}:
+        messages = body.get("messages")
+        if isinstance(messages, list):
+            for message in reversed(messages):
+                if isinstance(message, dict) and message.get("role") == "user":
+                    return message.get("content")
+        return None
+
+    if endpoint == "/v1/responses":
+        input_value = body.get("input")
+        if isinstance(input_value, list):
+            for item in reversed(input_value):
+                if isinstance(item, dict) and item.get("role") == "user":
+                    return item.get("content")
+        return input_value
+
+    return body
 
 
 def _body_requests_stream(body: bytes) -> bool:
