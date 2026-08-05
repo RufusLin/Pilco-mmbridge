@@ -170,18 +170,6 @@ The configured model context length and server limits must support the selected 
 
 See [Environment configuration](docs/ENVIRONMENT.md) for every available variable.
 
-### 6. Start the bridge
-
-```bash
-python main.py
-```
-
-You may also use the included scripts when appropriate:
-
-```text
-scripts/run_mm_bridge.sh
-scripts/run_mm_bridge.bat
-```
 
 ## Basic checks
 
@@ -243,38 +231,6 @@ curl http://127.0.0.1:18000/v1/chat/completions \
    ├─ run_mm_bridge.bat
    └─ run_mm_bridge.sh
 ```
-
-## Security before publishing
-
-Do not commit the real `.env` file. It may contain:
-
-- The bridge access token
-- Upstream API keys
-- Private IP addresses
-- Internal hostnames or service URLs
-
-Only commit `.env.example`.
-
-Before pushing, verify that `.env` is ignored:
-
-```bash
-git check-ignore -v .env
-```
-
-If `.env` was already tracked, remove it from Git tracking without deleting the local file:
-
-```bash
-git rm --cached .env
-```
-
-Also keep these runtime directories out of Git because they may contain prompts, media, model outputs, or internal URLs:
-
-```text
-.cache/
-.debug/
-```
-
-If a real token has already been exposed, replace it with a newly generated token. Removing the text from the latest file does not invalidate a credential that has already been copied or committed.
 
 ## Important limitations
 
