@@ -170,18 +170,6 @@ The configured model context length and server limits must support the selected 
 
 See [Environment configuration](docs/ENVIRONMENT.md) for every available variable.
 
-### 6. Start the bridge
-
-```bash
-python main.py
-```
-
-You may also use the included scripts when appropriate:
-
-```text
-scripts/run_mm_bridge.sh
-scripts/run_mm_bridge.bat
-```
 
 ## Basic checks
 
