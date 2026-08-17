@@ -45,31 +45,31 @@ The bridge preserves the incoming API protocol and endpoint. It does not transla
 
 - Direct pass-through for requests without media
 - Question-aware visual analysis for requests with media
-- Verbatim OCR fields separated from visual interpretation
+- Verbatim OCR, speech, and lyrics blocks separated from visual and audio analysis
 - Question-aware analysis cache
 - OpenAI- and Anthropic-compatible request handling
 - Optional media replacement for text-only final models
 - SSE streaming with optional heartbeat messages
 - Automatic model discovery through `/v1/models`
 
-## OCR and visual reasoning
+## Multimodal evidence blocks
 
-The analyzer is instructed to keep visible text and interpretation in separate fields.
+The analyzer returns one `media` array without a top-level summary or candidate answer.
 
 ```text
-exact_ocr_text / ocr_blocks[].text
-└─ Verbatim visible text
+text_blocks
+└─ Verbatim OCR, speech, and lyrics with spatial or temporal locations
 
-direct_visual_observations
-└─ Directly visible objects, states, values, and locations
+visual_blocks
+└─ Image/video UI states, document structure, tables, charts, diagrams, and spatial relationships
 
-task_relevant_visual_reasoning / candidate_visual_answer
-└─ Question-guided visual interpretation
+audio_blocks
+└─ Audio/video sound events and supported musical analysis
 ```
 
-For an exact transcription request, the final text model is instructed to use the verbatim OCR fields rather than replacing them with a translation, correction, summary, or inferred meaning.
+For an exact transcription request, the final text model is instructed to use `text_blocks[].text` rather than replacing it with a translation, correction, summary, or inferred meaning. `visual_blocks[].basis` distinguishes directly observed evidence from inferred conclusions.
 
-For a game screenshot, the analyzer can use the user's exact question to inspect relevant HUD values, minimaps, markers, routes, entities, obstacles, and threat indicators.
+The user's exact request guides inspection depth without allowing relevant text, UI state, document structure, chart relationships, or audio events to be omitted.
 
 > This separation is currently enforced by prompting and field conventions. It does not guarantee perfect OCR, and the bridge does not yet validate the analyzer output against a strict JSON Schema.
 

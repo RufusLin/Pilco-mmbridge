@@ -103,116 +103,107 @@ Token fields are selected by protocol:
 
 The value comes from `MM_ANALYZER_MAX_TOKENS`. The project recommends at least `16384` for complex OCR, game screens, source-code screenshots, terminal output, and multi-image requests.
 
-## OCR evidence and interpretation
+## Multimodal evidence output
 
-The analyzer prompt defines separate output channels.
+The analyzer returns a single top-level `media` array. It does not return a top-level summary, candidate answer, or recommendation.
 
-### Verbatim OCR channel
+### Text blocks
+
+`text_blocks` contain verbatim OCR, speech, or lyrics. `source` identifies which kind of text was extracted, while `location` records an image position, audio time range, or video time and position.
 
 ```json
 {
-  "exact_ocr_text": "Warning\nConnection refused",
-  "ocr_blocks": [
-    {
-      "text": "Connection refused",
-      "location": "center dialog body",
-      "confidence": "high",
-      "uncertainty": ""
-    }
-  ],
-  "terminal_or_error_text": "Connection refused",
-  "code_or_command_text": "",
-  "ui_text": "Retry\nCancel"
+  "source": "ocr",
+  "text": "Connection refused",
+  "location": "center dialog body",
+  "confidence": "high",
+  "uncertainty": ""
 }
 ```
 
-The prompt instructs the analyzer to preserve:
+The analyzer preserves meaningful line breaks, casing, punctuation, commands, paths, URLs, error codes, timestamps, labels, and numbers. It does not correct, translate, paraphrase, summarize, or complete missing text. Unclear spans use `[unreadable]` or `[uncertain: candidate1|candidate2]`.
 
-- Line breaks and meaningful spacing
-- Casing and punctuation
-- Paths and filenames
-- Commands and flags
-- Ports and URLs
-- Error codes and timestamps
-- Stack traces and code snippets
-- Labels and numeric values
+### Visual blocks
 
-The analyzer is instructed not to correct, normalize, translate, paraphrase, summarize, or infer missing OCR text. Unclear spans should use markers such as:
-
-```text
-[unreadable]
-[uncertain: 0|O]
-```
-
-### Direct visual evidence
+Images and videos with visual content may include `visual_blocks` for UI states, document structure, tables, charts, diagrams, objects, and spatial relationships.
 
 ```json
 {
-  "direct_visual_observations": [
-    "A warning dialog is visible in the center of the screen."
-  ]
+  "kind": "ui",
+  "subject": "Save button",
+  "description": "The button is grey and appears disabled.",
+  "location": "form bottom-right",
+  "relationships": [
+    "The same form shows a required-email validation error."
+  ],
+  "basis": "observed",
+  "confidence": "high",
+  "uncertainty": ""
 }
 ```
 
-These entries describe directly visible objects, values, states, or spatial relationships without presenting them as a final answer.
+`basis="observed"` marks directly visible evidence. `basis="inferred"` marks a supported conclusion and must identify its visible basis and uncertainty.
 
-### Question-guided interpretation
+### Audio blocks
+
+Audio and videos with an audio track may include `audio_blocks`. Spoken words and lyrics remain in `text_blocks`; `audio_blocks` contain non-verbal sound events and supported music analysis.
 
 ```json
 {
-  "task_relevant_visual_reasoning": [
-    {
-      "claim": "The target endpoint rejected the connection.",
-      "evidence": "The dialog displays 'Connection refused'.",
-      "confidence": "high"
-    }
-  ],
-  "candidate_visual_answer": "The screen shows a connection-refused error."
+  "kind": "music",
+  "description": "A slow minor-key instrumental passage.",
+  "location": "00:10.000-00:28.500",
+  "musical_features": {
+    "style_or_character": "somber and sustained",
+    "tonal_center": "A minor",
+    "harmony": "repeating Am-F-C-G progression",
+    "melody": "descending phrase repeated by strings",
+    "rhythm_meter_tempo": "4/4, approximately 70 BPM",
+    "form": "repeating eight-bar section",
+    "instrumentation": "strings and soft piano"
+  },
+  "confidence": "medium",
+  "uncertainty": "The tonal center may shift briefly near the end."
 }
 ```
 
-These fields are model-generated inference. The final text model is explicitly told not to use them as a replacement for verbatim OCR.
+Musical details must be omitted or marked uncertain when they cannot be heard reliably.
 
-## Game-screen example
+### Complete image example
 
 ```json
 {
-  "exact_ocr_text": "63\n18 / 72\n24m",
-  "ocr_blocks": [
+  "media": [
     {
-      "text": "63",
-      "location": "top-left health HUD",
-      "confidence": "high",
-      "uncertainty": ""
-    },
-    {
-      "text": "18 / 72",
-      "location": "bottom-right ammunition HUD",
-      "confidence": "high",
-      "uncertainty": ""
-    },
-    {
-      "text": "24m",
-      "location": "top-right minimap",
-      "confidence": "medium",
-      "uncertainty": ""
-    }
-  ],
-  "direct_visual_observations": [
-    "The objective marker is toward the upper-right.",
-    "An open doorway is visible on the right."
-  ],
-  "task_relevant_visual_reasoning": [
-    {
-      "claim": "The right doorway is the most likely route.",
-      "evidence": "The doorway aligns with the minimap objective direction.",
-      "confidence": "medium"
+      "index": 1,
+      "type": "image",
+      "text_blocks": [
+        {
+          "source": "ocr",
+          "text": "Email is required",
+          "location": "below the email input",
+          "confidence": "high",
+          "uncertainty": ""
+        }
+      ],
+      "visual_blocks": [
+        {
+          "kind": "ui",
+          "subject": "Email input",
+          "description": "The input is empty and has a red error border.",
+          "location": "form center",
+          "relationships": [
+            "The required-email message is immediately below it."
+          ],
+          "basis": "observed",
+          "confidence": "high",
+          "uncertainty": ""
+        }
+      ]
     }
   ]
 }
 ```
-
-The OCR values and route inference remain separate so the final text model can distinguish visible values from a visual conclusion.
 
 ## Final context injection
 
@@ -220,11 +211,12 @@ The OCR values and route inference remain separate so the final text model can d
 
 The injected context tells the final text model:
 
-- `exact_ocr_text` and `ocr_blocks[].text` are the canonical verbatim text evidence.
-- Exact transcription requests must use those OCR fields.
+- `text_blocks[].text` is the canonical verbatim OCR, speech, and lyrics evidence.
+- `text_blocks[].source` distinguishes OCR, speech, and lyrics.
+- Exact transcription requests must use the text blocks.
 - Original text must be shown separately before translation or explanation when both are requested.
-- `direct_visual_observations` are direct evidence.
-- `task_relevant_visual_reasoning` and `candidate_visual_answer` are fallible machine-generated inferences.
+- `visual_blocks[].basis` distinguishes direct observations from fallible inferences.
+- `audio_blocks` contain non-verbal sound events or fallible musical analysis.
 - Uncertainty markers must be preserved.
 
 ## Question-aware cache
