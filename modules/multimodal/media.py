@@ -109,8 +109,37 @@ def _is_anthropic_media_block(obj: dict[str, Any]) -> tuple[bool, str]:
 
     return False, ""
 
+
+def _is_mcp_media_block(obj: dict[str, Any]) -> tuple[bool, str]:
+    """Recognize MCP ImageContent/AudioContent and compatible video extensions."""
+    media_type = obj.get("type")
+    data = obj.get("data")
+    mime_type = obj.get("mimeType") or obj.get("mime_type")
+    if (
+        isinstance(media_type, str)
+        and media_type in {"image", "audio", "video"}
+        and isinstance(data, str)
+        and bool(data)
+        and isinstance(mime_type, str)
+        and mime_type.lower().startswith(f"{media_type}/")
+    ):
+        return True, media_type
+    return False, ""
+
+
+def _detect_media_block(obj: dict[str, Any]) -> tuple[bool, str | None]:
+    is_media, kind = _is_openai_media_block(obj)
+    if not is_media:
+        is_media, kind = _is_anthropic_media_block(obj)
+    if not is_media:
+        is_media, kind = _is_mcp_media_block(obj)
+    return is_media, kind or None
+
 def _approx_block_bytes(block: Any) -> int:
     if isinstance(block, dict):
+        is_mcp, _ = _is_mcp_media_block(block)
+        if is_mcp:
+            return _size_of_url_or_b64(block["data"])
         # Official OpenAI Chat multimedia fields.
         if block.get("type") == "image_url" and isinstance(block.get("image_url"), dict):
             url = block["image_url"].get("url")
@@ -148,9 +177,7 @@ def find_media_items(value: Any) -> list[MediaItem]:
 
     def walk(node: Any, path: str) -> None:
         if isinstance(node, dict):
-            is_mm, kind = _is_openai_media_block(node)
-            if not is_mm:
-                is_mm, kind = _is_anthropic_media_block(node)
+            is_mm, kind = _detect_media_block(node)
             if is_mm:
                 block = copy.deepcopy(node)
                 data = canonical_json(block)
@@ -198,6 +225,97 @@ def media_summary(items: list[MediaItem]) -> str:
     return "\n".join(lines)
 
 
+def media_block_for_endpoint(item: MediaItem, endpoint: str) -> Any:
+    """Convert raw MCP media content to the analyzer endpoint's official shape."""
+    block = item.block
+    if not isinstance(block, dict):
+        return copy.deepcopy(block)
+    is_mcp, kind = _is_mcp_media_block(block)
+    if not is_mcp:
+        return copy.deepcopy(block)
+
+    data, mime_type = _mcp_data_and_mime(block)
+    endpoint = endpoint.rstrip("/")
+
+    if endpoint == "/v1/chat/completions":
+        if kind == "image":
+            return {
+                "type": "image_url",
+                "image_url": {"url": _as_data_uri(data, mime_type)},
+            }
+        if kind == "audio":
+            return {
+                "type": "input_audio",
+                "input_audio": {
+                    "data": data,
+                    "format": _audio_format(mime_type),
+                },
+            }
+        return {
+            "type": "input_video",
+            "input_video": {"data": data, "mime_type": mime_type},
+        }
+
+    if endpoint == "/v1/responses":
+        if kind == "image":
+            return {
+                "type": "input_image",
+                "image_url": _as_data_uri(data, mime_type),
+            }
+        if kind == "audio":
+            return {
+                "type": "input_audio",
+                "input_audio": {
+                    "data": data,
+                    "format": _audio_format(mime_type),
+                },
+            }
+        return {
+            "type": "input_video",
+            "input_video": {"data": data, "mime_type": mime_type},
+        }
+
+    if endpoint == "/v1/messages":
+        return {
+            "type": kind,
+            "source": {
+                "type": "base64",
+                "media_type": mime_type,
+                "data": data,
+            },
+        }
+
+    return copy.deepcopy(block)
+
+
+def _mcp_data_and_mime(block: dict[str, Any]) -> tuple[str, str]:
+    data = str(block["data"])
+    mime_type = str(block.get("mimeType") or block.get("mime_type"))
+    if data.lower().startswith("data:"):
+        comma = data.find(",")
+        if comma >= 0:
+            header = data[5:comma]
+            declared = header.split(";", 1)[0]
+            if "/" in declared:
+                mime_type = declared
+            data = data[comma + 1 :]
+    return data, mime_type
+
+
+def _as_data_uri(data: str, mime_type: str) -> str:
+    return f"data:{mime_type};base64,{data}"
+
+
+def _audio_format(mime_type: str) -> str:
+    subtype = mime_type.split("/", 1)[-1].lower()
+    return {
+        "mpeg": "mp3",
+        "mp3": "mp3",
+        "x-wav": "wav",
+        "wave": "wav",
+    }.get(subtype, subtype)
+
+
 def replace_or_strip_media_blocks(value: Any, policy: str, placeholder_prefix: str = "attached media") -> Any:
     if policy == "keep":
         return value
@@ -205,9 +323,7 @@ def replace_or_strip_media_blocks(value: Any, policy: str, placeholder_prefix: s
 
     def transform(node: Any) -> Any:
         if isinstance(node, dict):
-            is_mm, kind = _is_openai_media_block(node)
-            if not is_mm:
-                is_mm, kind = _is_anthropic_media_block(node)
+            is_mm, kind = _detect_media_block(node)
             if is_mm:
                 counter["n"] += 1
                 label = f"[{placeholder_prefix} #{counter['n']} ({kind or 'media'}): analysis is included in the system/instructions context]"

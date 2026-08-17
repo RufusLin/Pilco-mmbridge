@@ -71,7 +71,7 @@ For an exact transcription request, the final text model is instructed to use `t
 
 The user's exact request guides inspection depth without allowing relevant text, UI state, document structure, chart relationships, or audio events to be omitted.
 
-> This separation is currently enforced by prompting and field conventions. It does not guarantee perfect OCR, and the bridge does not yet validate the analyzer output against a strict JSON Schema.
+> This separation is defined by prompting and validated field conventions. Validation rejects malformed, truncated, or unsupported evidence output, but it cannot guarantee perfect OCR.
 
 ## Requirements
 
@@ -223,6 +223,7 @@ curl http://127.0.0.1:18000/v1/chat/completions \
 │     ├─ app.py
 │     ├─ cache.py
 │     ├─ config.py
+│     ├─ context.py
 │     ├─ media.py
 │     ├─ prompting.py
 │     ├─ security.py
@@ -237,5 +238,5 @@ curl http://127.0.0.1:18000/v1/chat/completions \
 - The final text model does not receive visual tokens directly.
 - Visual information omitted by the analyzer cannot be reconstructed by the text model.
 - OCR accuracy depends on image quality, text size, compression, and the vision model.
-- The current implementation uses prompt-guided JSON output rather than strict schema validation.
+- Evidence validation checks the supported schema and truncation signals, but it does not prove that the analyzer observed every real detail correctly.
 - Small HUD values and dense screenshots may require higher-resolution inputs or future crop/retry logic.

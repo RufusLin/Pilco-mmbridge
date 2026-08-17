@@ -8,6 +8,7 @@ This package contains the complete MM-Bridge request pipeline: configuration loa
 |---|---|
 | `app.py` | FastAPI application, routing, request pipeline, model discovery, debug dumps, analyzer calls, and final upstream forwarding. |
 | `config.py` | Reads environment variables into the immutable `Settings` dataclass and defines supported policy types. |
+| `context.py` | Separates the active real-user request from the current direct-user or tool-result event so historical media is not reanalyzed. |
 | `media.py` | Finds image, audio, and video blocks; estimates media size; computes hashes; and keeps, replaces, or removes media in the final request. |
 | `prompting.py` | Extracts the exact user request, builds analyzer requests, defines OCR-safe prompts, injects analysis into the original protocol, rewrites model IDs, and extracts analyzer text. |
 | `cache.py` | Stores analyzer responses in a file cache keyed by prompt version, endpoint, analyzer model, media hashes, and the exact user request. |
@@ -22,7 +23,7 @@ Client request
   → check_client_auth()
   → assert_body_size()
   → parse JSON when possible
-  → find_media_items() returns an empty list
+  → extract_current_request_context() returns no current-event media
   → discover or use the final text-model ID
   → rewrite_model()
   → forward to VLLM_ROOT_URL using the original endpoint
@@ -35,17 +36,18 @@ The vision analyzer is not called.
 ```text
 Client request + media
   → authenticate and validate body size
-  → detect media blocks
+  → identify the current direct-user or tool-result event
+  → detect only media added by that event
   → enforce item-count and per-item size limits
   → verify that the endpoint supports analyzer injection
-  → extract the last user request text
+  → retain the latest actual user request that started the active tool chain
   → discover or use the vision-model ID
   → compute a question-aware cache key
      ├─ cache hit: reuse the analysis
      └─ cache miss:
           → build_analyzer_body()
           → send media + exact user request to LLAMA_ROOT_URL
-          → extract analyzer response text
+          → extract and validate analyzer evidence JSON
           → store the result in the cache
   → inject_analysis()
   → keep, replace, or strip original media
@@ -66,19 +68,16 @@ The bridge builds the analyzer request in the same protocol as the incoming endp
 
 No OpenAI-to-Anthropic or Anthropic-to-OpenAI translation is performed.
 
-## Exact user-request extraction
+## Current request context
 
-`extract_user_request_text()` reads only the latest user text needed to guide visual inspection.
+`extract_current_request_context()` separates two values:
 
-### Chat Completions and Messages
+- The latest actual user request that started the active request or tool chain
+- Media added by the current input event only
 
-It scans `messages` from the end and returns the text content of the latest `role: "user"` message. Media blocks are excluded.
+A direct user image uses text and media from that same user event. A trailing tool result uses only media from the latest tool-result batch while retaining the earlier actual user request. Tool-result wrappers represented as `role: "user"` are not treated as new user intent when protocol structure identifies them as part of the active tool call.
 
-### Responses API
-
-It handles a string `input` directly or scans list-based input for the latest user item containing `input_text` or `text` content.
-
-The original client request is not replaced by this extracted text. The text is copied only into the analyzer request.
+Historical media is never collected merely because it remains in the request body. The original client request is not replaced; its text is copied only into the analyzer request.
 
 ## Analyzer request
 
@@ -88,7 +87,7 @@ The original client request is not replaced by this extracted text. The text is 
 1. ANALYZER_SYSTEM_PROMPT
 2. The user's exact current request
 3. A media summary containing item metadata
-4. The original media blocks
+4. Media blocks normalized for the incoming analyzer protocol
 ```
 
 Analyzer requests always use `stream: false` because the bridge must receive the complete analysis before it can build the final text-model request.
@@ -125,11 +124,10 @@ The analyzer preserves meaningful line breaks, casing, punctuation, commands, pa
 
 ### Visual blocks
 
-Images and videos with visual content may include `visual_blocks` for UI states, document structure, tables, charts, diagrams, objects, and spatial relationships.
+Images and videos with visual content may include `visual_blocks` for UI states, document structure, tables, charts, diagrams, objects, and spatial relationships. The bridge does not assign or require a semantic `kind`; it passes the analyzer's evidence to the final model without classifying it again.
 
 ```json
 {
-  "kind": "ui",
   "subject": "Save button",
   "description": "The button is grey and appears disabled.",
   "location": "form bottom-right",
@@ -150,7 +148,6 @@ Audio and videos with an audio track may include `audio_blocks`. Spoken words an
 
 ```json
 {
-  "kind": "music",
   "description": "A slow minor-key instrumental passage.",
   "location": "00:10.000-00:28.500",
   "musical_features": {
@@ -188,7 +185,6 @@ Musical details must be omitted or marked uncertain when they cannot be heard re
       ],
       "visual_blocks": [
         {
-          "kind": "ui",
           "subject": "Email input",
           "description": "The input is empty and has a red error border.",
           "location": "form center",
@@ -243,7 +239,7 @@ The cache files are stored under `MM_ANALYZER_CACHE_DIR` and may contain analyze
 
 ## Media detection and replacement
 
-`find_media_items()` recursively scans dictionaries, lists, and strings for supported media forms, including common OpenAI and Anthropic content blocks.
+`find_media_items()` recursively scans the selected current event for supported media forms, including common OpenAI, Anthropic, and MCP content blocks.
 
 Representative supported forms include:
 
@@ -253,6 +249,7 @@ input_image
 input_audio
 input_video
 Anthropic image/audio/video source blocks
+MCP image/audio content using data and mimeType
 data:...;base64,... URLs
 recognized HTTP, HTTPS, and file media URLs
 ```
@@ -323,8 +320,7 @@ These files may contain user prompts, base64 media, internal URLs, analyzer outp
 
 ## Current limitations
 
-- OCR and interpretation separation is prompt-enforced, not validated by a strict JSON Schema.
-- Analyzer JSON is extracted as text and injected without field-level Python validation.
+- Field-level validation checks the supported evidence contract and truncation signals, but semantic OCR and visual-analysis accuracy still depends on the analyzer.
 - The current implementation performs one analyzer call per cache miss.
 - There is no automatic crop, zoom, OCR retry, or second-pass inspection.
 - The vision model may still misread small or compressed text.

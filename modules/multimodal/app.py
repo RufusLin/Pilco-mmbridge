@@ -14,13 +14,15 @@ from fastapi.responses import JSONResponse, Response
 
 from .cache import AnalysisCache, make_cache_key
 from .config import Settings
-from .media import find_media_items, replace_or_strip_media_blocks
+from .context import extract_current_request_context
+from .media import replace_or_strip_media_blocks
 from .prompting import (
+    analyzer_truncation_reason,
     build_analyzer_body,
     extract_text_from_upstream_response,
-    extract_user_request_text,
     inject_analysis,
     rewrite_model,
+    validate_analysis_text,
 )
 from .security import assert_body_size, check_client_auth
 from .upstream import (
@@ -93,8 +95,8 @@ def create_app(settings: Settings) -> FastAPI:
         if not isinstance(body, dict):
             return await _forward_raw(request, settings, client, request_id, stage="vllm_direct", body_bytes=body_bytes)
 
-        current_user_content = _latest_user_content(body, endpoint)
-        media_items = find_media_items(current_user_content)
+        request_context = extract_current_request_context(body, endpoint)
+        media_items = request_context.media_items
         if len(media_items) > settings.max_media_items:
             raise HTTPException(
                 status_code=413,
@@ -146,22 +148,40 @@ def create_app(settings: Settings) -> FastAPI:
             return await _forward_json_to_vllm(request, settings, client, request_id, _json_bytes(final_body), stage="vllm_passthrough_media_unsupported_endpoint")
 
         logger.info(
-            "request_id=%s media_detected path=%s media_count=%s policy=%s",
+            "request_id=%s media_detected path=%s origin=%s media_count=%s policy=%s",
             request_id,
             endpoint,
+            request_context.event_kind,
             len(media_items),
             settings.vllm_media_policy,
         )
         _debug_dump(settings, request_id, "incoming.json", body)
 
         llama_model = await _llama_model(settings, client)
-        user_request_text = extract_user_request_text(body, normalized_endpoint)
+        user_request_text = request_context.user_request_text
         cache_key = make_cache_key(normalized_endpoint, llama_model, media_items, user_request_text)
         analysis_text = cache.get(cache_key) if settings.analyzer_cache else None
         if analysis_text:
-            logger.info("request_id=%s analyzer_cache_hit key=%s", request_id, cache_key[:16])
-        else:
-            analyzer_body = build_analyzer_body(body, normalized_endpoint, media_items, settings, llama_model)
+            try:
+                analysis_text = validate_analysis_text(analysis_text, len(media_items))
+                logger.info("request_id=%s analyzer_cache_hit key=%s", request_id, cache_key[:16])
+            except ValueError as exc:
+                logger.warning(
+                    "request_id=%s analyzer_cache_invalid key=%s error=%s",
+                    request_id,
+                    cache_key[:16],
+                    exc,
+                )
+                analysis_text = None
+        if not analysis_text:
+            analyzer_body = build_analyzer_body(
+                body,
+                normalized_endpoint,
+                media_items,
+                settings,
+                llama_model,
+                user_request_text=user_request_text,
+            )
             _debug_dump(settings, request_id, "llama_request.json", analyzer_body)
             analyzer_result = await _call_llama_analyzer(request, settings, client, request_id, endpoint, analyzer_body)
             _debug_dump_bytes(settings, request_id, "llama_response.body", analyzer_result.body)
@@ -192,10 +212,53 @@ def create_app(settings: Settings) -> FastAPI:
                 # Optional fail-open: final vLLM receives original request.
                 analysis_text = ""
             else:
-                analysis_payload = analyzer_result.json()
-                analysis_text = extract_text_from_upstream_response(normalized_endpoint, analysis_payload)
-                if settings.analyzer_cache:
-                    cache.set(cache_key, analysis_text, {"endpoint": normalized_endpoint, "model": llama_model})
+                try:
+                    analysis_payload = analyzer_result.json()
+                    truncation_reason = analyzer_truncation_reason(
+                        normalized_endpoint, analysis_payload
+                    )
+                    if truncation_reason:
+                        raise ValueError(
+                            f"analyzer output was truncated: {truncation_reason}"
+                        )
+                    extracted = extract_text_from_upstream_response(
+                        normalized_endpoint, analysis_payload
+                    )
+                    analysis_text = validate_analysis_text(extracted, len(media_items))
+                except (TypeError, ValueError) as exc:
+                    logger.error(
+                        "request_id=%s analyzer_output_invalid path=%s error=%s",
+                        request_id,
+                        endpoint,
+                        exc,
+                    )
+                    if settings.fail_on_analyzer_error:
+                        return JSONResponse(
+                            {
+                                "error": {
+                                    "stage": "llama_analyzer_validation",
+                                    "path": endpoint,
+                                    "message": str(exc),
+                                    "request_id": request_id,
+                                }
+                            },
+                            status_code=502,
+                            headers={
+                                "x-mm-bridge-stage": "llama_analyzer_validation",
+                                "x-mm-bridge-request-id": request_id,
+                            },
+                        )
+                    analysis_text = ""
+                if analysis_text and settings.analyzer_cache:
+                    cache.set(
+                        cache_key,
+                        analysis_text,
+                        {
+                            "endpoint": normalized_endpoint,
+                            "model": llama_model,
+                            "event_kind": request_context.event_kind,
+                        },
+                    )
 
         final_body = inject_analysis(body, normalized_endpoint, analysis_text or "", settings)
         final_body = rewrite_model(final_body, await _vllm_model(settings, client), settings.bridge_model_id, settings.rewrite_bridge_model_only)
@@ -341,28 +404,6 @@ def _looks_json(request: Request, body: bytes) -> bool:
         return True
     stripped = body.lstrip()
     return stripped.startswith(b"{") or stripped.startswith(b"[")
-
-
-def _latest_user_content(body: dict[str, Any], endpoint: str) -> Any:
-    endpoint = endpoint.rstrip("/")
-
-    if endpoint in {"/v1/chat/completions", "/v1/messages"}:
-        messages = body.get("messages")
-        if isinstance(messages, list):
-            for message in reversed(messages):
-                if isinstance(message, dict) and message.get("role") == "user":
-                    return message.get("content")
-        return None
-
-    if endpoint == "/v1/responses":
-        input_value = body.get("input")
-        if isinstance(input_value, list):
-            for item in reversed(input_value):
-                if isinstance(item, dict) and item.get("role") == "user":
-                    return item.get("content")
-        return input_value
-
-    return body
 
 
 def _body_requests_stream(body: bytes) -> bool:

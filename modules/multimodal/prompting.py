@@ -5,9 +5,14 @@ import json
 from typing import Any
 
 from .config import Settings
-from .media import MediaItem, media_summary, replace_or_strip_media_blocks
+from .media import (
+    MediaItem,
+    media_block_for_endpoint,
+    media_summary,
+    replace_or_strip_media_blocks,
+)
 
-ANALYZER_PROMPT_VERSION = "official-transparent-v7-evidence-blocks"
+ANALYZER_PROMPT_VERSION = "official-transparent-v8-direct-evidence"
 
 ANALYZER_SYSTEM_PROMPT = """You are a faithful multimodal evidence extractor for a separate text-only reasoning model.
 
@@ -46,7 +51,6 @@ Use visual_blocks to describe directly visible structure and state, including:
 - objects, scenes, positions, and spatial relationships needed for the user's request.
 
 Each visual block must contain:
-- kind: "ui", "table", "chart", "diagram", "scene", or "object"
 - subject: the observed or inferred subject
 - description: the visible state, structure, or carefully supported conclusion
 - location: the spatial location, or the time and spatial location for video
@@ -64,13 +68,12 @@ Spoken dialogue and lyrics belong in text_blocks.
 Use audio_blocks for non-verbal sound events and music analysis.
 
 Each audio block must contain:
-- kind: "music" or "sound_event"
 - description: the audible event or musical character
 - location: the time range
 - confidence: "high", "medium", or "low"
 - uncertainty: an empty string when there is no uncertainty
 
-For kind="music", also include musical_features with:
+When an audio block describes music, also include musical_features with:
 - style_or_character
 - tonal_center
 - harmony
@@ -79,7 +82,7 @@ For kind="music", also include musical_features with:
 - form
 - instrumentation
 
-Omit musical_features for kind="sound_event".
+Omit musical_features for non-musical sound events.
 Describe musical features only when they can be supported by the audio. Do not invent an exact chord, key, instrument, or musical structure when it cannot be heard reliably; record uncertainty instead.
 
 OUTPUT
@@ -189,20 +192,28 @@ def rewrite_model(body: Any, target_model: str, bridge_model_id: str, bridge_onl
     return out
 
 
-def _media_blocks(items: list[MediaItem]) -> list[Any]:
-    return [copy.deepcopy(item.block) for item in items]
+def _media_blocks(items: list[MediaItem], path: str) -> list[Any]:
+    return [media_block_for_endpoint(item, path) for item in items]
 
 
-def build_analyzer_body(original: dict[str, Any], path: str, items: list[MediaItem], settings: Settings, llama_model: str) -> dict[str, Any]:
+def build_analyzer_body(
+    original: dict[str, Any],
+    path: str,
+    items: list[MediaItem],
+    settings: Settings,
+    llama_model: str,
+    user_request_text: str | None = None,
+) -> dict[str, Any]:
     """Build an analyzer request using the same official protocol as the incoming endpoint.
 
-    This intentionally does not translate Anthropic<->OpenAI. It only constructs a minimal
-    official request for the same endpoint with the original media blocks and analyzer instructions.
+    This intentionally does not translate Anthropic<->OpenAI. It constructs a minimal
+    request for the same endpoint with normalized media blocks and analyzer instructions.
     """
     path = path.rstrip("/")
-    blocks = _media_blocks(items)
+    blocks = _media_blocks(items, path)
     media_list_text = media_summary(items)
-    user_request_text = extract_user_request_text(original, path)
+    if user_request_text is None:
+        user_request_text = extract_user_request_text(original, path)
     if not user_request_text:
         user_request_text = "(No textual user request was supplied.)"
     instruction_text = (
@@ -367,6 +378,196 @@ def extract_text_from_upstream_response(path: str, payload: Any) -> str:
             return "\n".join(text_parts)
 
     return json.dumps(payload, ensure_ascii=False)
+
+
+def analyzer_truncation_reason(path: str, payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    path = path.rstrip("/")
+
+    if path == "/v1/chat/completions":
+        choices = payload.get("choices")
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            reason = choices[0].get("finish_reason")
+            if reason in {"length", "max_tokens"}:
+                return str(reason)
+
+    if path == "/v1/messages":
+        reason = payload.get("stop_reason")
+        if reason in {"max_tokens", "length"}:
+            return str(reason)
+
+    if path == "/v1/responses" and payload.get("status") == "incomplete":
+        details = payload.get("incomplete_details")
+        if isinstance(details, dict) and details.get("reason"):
+            return str(details["reason"])
+        return "incomplete"
+
+    return None
+
+
+def validate_analysis_text(analysis_text: str, expected_media_count: int) -> str:
+    try:
+        payload = json.loads(analysis_text)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("analyzer output is not valid JSON") from exc
+
+    if not isinstance(payload, dict) or set(payload) != {"media"}:
+        raise ValueError('analyzer output must contain only the top-level "media" field')
+    media = payload.get("media")
+    if not isinstance(media, list):
+        raise ValueError('analyzer output "media" must be an array')
+    if len(media) != expected_media_count:
+        raise ValueError(
+            f"analyzer output media count {len(media)} does not match input count {expected_media_count}"
+        )
+
+    for expected_index, item in enumerate(media, start=1):
+        _validate_media_item(item, expected_index)
+
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _validate_media_item(item: Any, expected_index: int) -> None:
+    if not isinstance(item, dict):
+        raise ValueError(f"media[{expected_index - 1}] must be an object")
+    allowed = {"index", "type", "text_blocks", "visual_blocks", "audio_blocks"}
+    required = {"index", "type", "text_blocks"}
+    _validate_keys(item, required, allowed, f"media[{expected_index - 1}]")
+
+    index = item.get("index")
+    if isinstance(index, bool) or index != expected_index:
+        raise ValueError(f"media index must be {expected_index}")
+    media_type = item.get("type")
+    if media_type not in {"image", "audio", "video", "media"}:
+        raise ValueError(f"media[{expected_index - 1}].type is invalid")
+
+    text_blocks = item.get("text_blocks")
+    if not isinstance(text_blocks, list):
+        raise ValueError(f"media[{expected_index - 1}].text_blocks must be an array")
+    for block_index, block in enumerate(text_blocks):
+        _validate_text_block(block, f"media[{expected_index - 1}].text_blocks[{block_index}]")
+
+    if "visual_blocks" in item:
+        if media_type not in {"image", "video", "media"}:
+            raise ValueError("visual_blocks are not allowed for audio-only media")
+        visual_blocks = item["visual_blocks"]
+        if not isinstance(visual_blocks, list):
+            raise ValueError("visual_blocks must be an array")
+        for block_index, block in enumerate(visual_blocks):
+            _validate_visual_block(
+                block,
+                f"media[{expected_index - 1}].visual_blocks[{block_index}]",
+            )
+
+    if "audio_blocks" in item:
+        if media_type not in {"audio", "video", "media"}:
+            raise ValueError("audio_blocks are not allowed for image-only media")
+        audio_blocks = item["audio_blocks"]
+        if not isinstance(audio_blocks, list):
+            raise ValueError("audio_blocks must be an array")
+        for block_index, block in enumerate(audio_blocks):
+            _validate_audio_block(
+                block,
+                f"media[{expected_index - 1}].audio_blocks[{block_index}]",
+            )
+
+
+def _validate_text_block(block: Any, path: str) -> None:
+    required = {"source", "text", "location", "confidence", "uncertainty"}
+    _validate_object(block, required, path)
+    if block["source"] not in {"ocr", "speech", "lyrics"}:
+        raise ValueError(f"{path}.source is invalid")
+    _validate_string_fields(block, {"text", "location", "uncertainty"}, path)
+    _validate_confidence(block["confidence"], f"{path}.confidence")
+
+
+def _validate_visual_block(block: Any, path: str) -> None:
+    required = {
+        "subject",
+        "description",
+        "location",
+        "relationships",
+        "basis",
+        "confidence",
+        "uncertainty",
+    }
+    if not isinstance(block, dict):
+        raise ValueError(f"{path} must be an object")
+    # The analyzer may attach its own descriptive label. The bridge does not
+    # classify or reinterpret that label; it passes it through unchanged.
+    _validate_keys(block, required, required | {"kind"}, path)
+    if block["basis"] not in {"observed", "inferred"}:
+        raise ValueError(f"{path}.basis is invalid")
+    _validate_string_fields(
+        block,
+        {"subject", "description", "location", "uncertainty"},
+        path,
+    )
+    relationships = block["relationships"]
+    if not isinstance(relationships, list) or not all(
+        isinstance(value, str) for value in relationships
+    ):
+        raise ValueError(f"{path}.relationships must be an array of strings")
+    _validate_confidence(block["confidence"], f"{path}.confidence")
+
+
+def _validate_audio_block(block: Any, path: str) -> None:
+    required = {"description", "location", "confidence", "uncertainty"}
+    if not isinstance(block, dict):
+        raise ValueError(f"{path} must be an object")
+    # musical_features identifies a music analysis when present. Any analyzer-
+    # supplied kind label is descriptive only and is never used as a gate.
+    _validate_keys(
+        block,
+        required,
+        required | {"musical_features", "kind"},
+        path,
+    )
+    _validate_string_fields(block, {"description", "location", "uncertainty"}, path)
+    _validate_confidence(block["confidence"], f"{path}.confidence")
+
+    if "musical_features" in block:
+        features = block["musical_features"]
+        feature_fields = {
+            "style_or_character",
+            "tonal_center",
+            "harmony",
+            "melody",
+            "rhythm_meter_tempo",
+            "form",
+            "instrumentation",
+        }
+        _validate_object(features, feature_fields, f"{path}.musical_features")
+        _validate_string_fields(features, feature_fields, f"{path}.musical_features")
+
+
+def _validate_object(value: Any, fields: set[str], path: str) -> None:
+    if not isinstance(value, dict):
+        raise ValueError(f"{path} must be an object")
+    _validate_keys(value, fields, fields, path)
+
+
+def _validate_keys(
+    value: dict[str, Any], required: set[str], allowed: set[str], path: str
+) -> None:
+    missing = required - set(value)
+    extra = set(value) - allowed
+    if missing:
+        raise ValueError(f"{path} is missing fields: {', '.join(sorted(missing))}")
+    if extra:
+        raise ValueError(f"{path} has unsupported fields: {', '.join(sorted(extra))}")
+
+
+def _validate_string_fields(value: dict[str, Any], fields: set[str], path: str) -> None:
+    for field in fields:
+        if not isinstance(value.get(field), str):
+            raise ValueError(f"{path}.{field} must be a string")
+
+
+def _validate_confidence(value: Any, path: str) -> None:
+    if value not in {"high", "medium", "low"}:
+        raise ValueError(f"{path} is invalid")
 
 
 def _content_to_text(content: Any) -> str:
