@@ -52,6 +52,7 @@ class Settings:
     bridge_port: int = 18000
     bridge_token: str = ""
     bridge_model_id: str = "deepseek-v4-mm-bridge"
+    bridge_mode: int = 1
     log_level: str = "INFO"
 
     vllm_root_url: str = "http://127.0.0.1:8000"
@@ -103,6 +104,7 @@ class Settings:
             bridge_port=_int("MM_BRIDGE_PORT", 18000),
             bridge_token=os.getenv("MM_BRIDGE_TOKEN", ""),
             bridge_model_id=os.getenv("MM_BRIDGE_MODEL_ID", "deepseek-v4-mm-bridge"),
+            bridge_mode=_int("MM_BRIDGE_MODE", 1),
             log_level=os.getenv("MM_LOG_LEVEL", "INFO"),
             vllm_root_url=_root_url(os.getenv("VLLM_ROOT_URL", os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8000"))),
             vllm_api_key=os.getenv("VLLM_API_KEY", "EMPTY"),

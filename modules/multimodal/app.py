@@ -41,7 +41,7 @@ def create_app(settings: Settings) -> FastAPI:
     app = FastAPI(title="MM Bridge Official Transparent Proxy", version="2.0.0")
     timeout = httpx.Timeout(settings.http_timeout_seconds, connect=min(30.0, settings.http_timeout_seconds))
     client = httpx.AsyncClient(timeout=timeout, follow_redirects=False)
-    cache = AnalysisCache(settings.analyzer_cache_dir)
+    cache = None if settings.bridge_mode == 2 else AnalysisCache(settings.analyzer_cache_dir)
 
     app.state.settings = settings
     app.state.http_client = client
@@ -95,6 +95,23 @@ def create_app(settings: Settings) -> FastAPI:
         if not isinstance(body, dict):
             return await _forward_raw(request, settings, client, request_id, stage="vllm_direct", body_bytes=body_bytes)
 
+        if settings.bridge_mode == 2:
+            final_body = rewrite_model(
+                body,
+                await _vllm_model(settings, client),
+                settings.bridge_model_id,
+                settings.rewrite_bridge_model_only,
+            )
+            return await _forward_json_to_vllm(
+                request,
+                settings,
+                client,
+                request_id,
+                _json_bytes(final_body),
+                stage="vllm_direct",
+            )
+
+        assert cache is not None
         request_context = extract_current_request_context(body, endpoint)
         media_items = request_context.media_items
         if len(media_items) > settings.max_media_items:
