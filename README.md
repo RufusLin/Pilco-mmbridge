@@ -1,13 +1,13 @@
 # MM-Bridge
 
-MM-Bridge is a FastAPI proxy that connects a text-only reasoning model to a separate multimodal analyzer.
+MM-Bridge is a FastAPI proxy for OpenAI- and Anthropic-compatible model endpoints. It supports both a text-only reasoning model paired with a separate multimodal analyzer and a multimodal main model that can receive media directly.
 
-When a request contains no media, the bridge forwards it directly to the final text-model server. When a request contains an image, audio clip, or video, the bridge first asks the vision server to extract visual evidence, then injects that evidence into the original request before forwarding it to the text model.
+In Mode 1, requests without media go directly to the final text-model server. When the current request or tool-result event contains an image, audio clip, or video, the bridge asks the multimodal analyzer to extract evidence, normalizes and validates that evidence, and injects it into the final-model request. In Mode 2, analyzer enrichment is skipped and requests are forwarded to a multimodal main model.
 
 The bridge is designed for setups such as:
 
 - **Final reasoning model:** a text-only model served by vLLM
-- **Vision analyzer:** a multimodal model served by vLLM or another compatible server
+- **Multimodal analyzer:** a model served by vLLM or another compatible server
 - **Clients:** OpenWebUI, Cline, Claude Code, or any compatible API client
 
 > The existing `LLAMA_*` environment-variable names are kept for compatibility. `LLAMA_ROOT_URL` may point to a vision-capable vLLM server; llama.cpp is not required.
@@ -19,6 +19,8 @@ The bridge is designed for setups such as:
 
 ## What the bridge does
 
+Mode 1 enrichment flow:
+
 ```text
 Client
   │
@@ -27,11 +29,14 @@ MM-Bridge
   ├─ No media ───────────────────────────────► Final text model
   │
   └─ Media present
-       ├─ Send media + exact user request ───► Vision analyzer
-       ├─ Receive OCR and visual evidence
+       ├─ Send media + exact user request ───► Multimodal analyzer
+       ├─ Receive text, visual, and audio evidence
+       ├─ Normalize and validate the evidence
        ├─ Inject the evidence into the original request
        └─────────────────────────────────────► Final text model
 ```
+
+Mode 2 skips the analyzer branch and forwards the request to the configured multimodal main model after model-ID rewriting.
 
 The bridge preserves the incoming API protocol and endpoint. It does not translate OpenAI requests into Anthropic requests or vice versa.
 
@@ -44,9 +49,11 @@ The bridge preserves the incoming API protocol and endpoint. It does not transla
 ## Main features
 
 - Direct pass-through for requests without media
+- Mode 1 analyzer enrichment and Mode 2 direct multimodal forwarding
 - Question-aware visual analysis for requests with media
 - Verbatim OCR, speech, and lyrics blocks separated from visual and audio analysis
 - Question-aware analysis cache
+- Analyzer-source response headers (`analyzer`, `cache`, or `fail_open`)
 - OpenAI- and Anthropic-compatible request handling
 - Optional media replacement for text-only final models
 - SSE streaming with optional heartbeat messages
@@ -67,17 +74,25 @@ audio_blocks
 └─ Audio/video sound events and supported musical analysis
 ```
 
+A `media` array item always represents one attached file. A composite image
+with several panels, subfigures, charts, or regions remains one media item and
+uses several `visual_blocks`. Supported item types are exactly `image`,
+`video`, and `audio`; there is no generic `media` type.
+
 For an exact transcription request, the final text model is instructed to use `text_blocks[].text` rather than replacing it with a translation, correction, summary, or inferred meaning. `visual_blocks[].basis` distinguishes directly observed evidence from inferred conclusions.
 
 The user's exact request guides inspection depth without allowing relevant text, UI state, document structure, chart relationships, or audio events to be omitted.
 
-> This separation is defined by prompting and validated field conventions. Validation rejects malformed, truncated, or unsupported evidence output, but it cannot guarantee perfect OCR.
+> The bridge normalizes recoverable analyzer shape drift against the incoming
+> attachment metadata before validation. Malformed, truncated, or ambiguous
+> multi-attachment output is still rejected, and validation cannot guarantee
+> perfect OCR.
 
 ## Requirements
 
 - Python 3.10 or newer
 - A text-model server compatible with the endpoints used by your client
-- A multimodal vision-model server compatible with the same endpoints
+- A multimodal analyzer server for Mode 1, compatible with the endpoints used by your client
 - The Python packages listed in `requirements.txt`
 
 ## Installation
@@ -85,8 +100,8 @@ The user's exact request guides inspection depth without allowing relevant text,
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/YOUR_ACCOUNT/YOUR_REPOSITORY.git
-cd YOUR_REPOSITORY
+git clone https://github.com/gpdev-Pilcothink/Pilco-mmbridge.git
+cd Pilco-mmbridge
 ```
 
 ### 2. Create and activate a virtual environment
@@ -179,7 +194,7 @@ See [Environment configuration](docs/ENVIRONMENT.md) for every available variabl
 curl http://127.0.0.1:18000/health
 ```
 
-> The current health response may include upstream configuration details. Do not expose `/health` publicly without access control or a reverse-proxy rule.
+The public health response reports bridge state without exposing either upstream URL or the configured analyzer endpoint list.
 
 ### Model list
 
@@ -215,22 +230,20 @@ curl http://127.0.0.1:18000/v1/chat/completions \
 ├─ README.md
 ├─ docs/
 │  └─ ENVIRONMENT.md
-├─ modules/
-│  ├─ __init__.py
-│  └─ multimodal/
-│     ├─ __init__.py
-│     ├─ README.md
-│     ├─ app.py
-│     ├─ cache.py
-│     ├─ config.py
-│     ├─ context.py
-│     ├─ media.py
-│     ├─ prompting.py
-│     ├─ security.py
-│     └─ upstream.py
-└─ scripts/
-   ├─ run_mm_bridge.bat
-   └─ run_mm_bridge.sh
+└─ modules/
+   ├─ __init__.py
+   └─ multimodal/
+      ├─ __init__.py
+      ├─ README.md
+      ├─ analysis_contract.py
+      ├─ app.py
+      ├─ cache.py
+      ├─ config.py
+      ├─ context.py
+      ├─ media.py
+      ├─ prompting.py
+      ├─ security.py
+      └─ upstream.py
 ```
 
 ## Important limitations

@@ -52,6 +52,7 @@ class UpstreamResult:
     headers: dict[str, str]
     body: bytes
     url: str
+    elapsed_ms: int = 0
 
     @property
     def ok(self) -> bool:
@@ -68,6 +69,38 @@ class UpstreamResult:
             return self.body.decode("utf-8", errors="replace")
         except Exception:
             return repr(self.body)
+
+
+class UpstreamTimeoutError(Exception):
+    def __init__(
+        self,
+        *,
+        stage: str,
+        request_id: str,
+        elapsed_ms: int,
+    ) -> None:
+        super().__init__(f"upstream timeout during {stage}")
+        self.stage = stage
+        self.request_id = request_id
+        self.elapsed_ms = elapsed_ms
+        self.analyzer_source: str | None = None
+
+
+class UpstreamRequestError(Exception):
+    def __init__(
+        self,
+        *,
+        stage: str,
+        request_id: str,
+        elapsed_ms: int,
+        error_type: str,
+    ) -> None:
+        super().__init__(f"upstream request failed during {stage}: {error_type}")
+        self.stage = stage
+        self.request_id = request_id
+        self.elapsed_ms = elapsed_ms
+        self.error_type = error_type
+        self.analyzer_source: str | None = None
 
 
 def build_upstream_url(root_url: str, path: str, query: str = "") -> str:
@@ -122,14 +155,69 @@ async def request_bytes(
     url: str,
     headers: dict[str, str],
     body: bytes,
+    *,
+    stage: str,
+    request_id: str,
 ) -> UpstreamResult:
-    resp = await client.request(method, url, headers=headers, content=body)
-    return UpstreamResult(
+    started = time.perf_counter()
+    logger.info(
+        "request_id=%s upstream_start stage=%s method=%s request_bytes=%s",
+        request_id,
+        stage,
+        method,
+        len(body),
+    )
+    try:
+        resp = await client.request(method, url, headers=headers, content=body)
+    except httpx.TimeoutException as exc:
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        logger.warning(
+            "request_id=%s upstream_timeout stage=%s elapsed_ms=%s",
+            request_id,
+            stage,
+            elapsed_ms,
+        )
+        raise UpstreamTimeoutError(
+            stage=stage,
+            request_id=request_id,
+            elapsed_ms=elapsed_ms,
+        ) from exc
+    except httpx.RequestError as exc:
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        logger.warning(
+            "request_id=%s upstream_request_error stage=%s "
+            "elapsed_ms=%s error_type=%s",
+            request_id,
+            stage,
+            elapsed_ms,
+            type(exc).__name__,
+        )
+        raise UpstreamRequestError(
+            stage=stage,
+            request_id=request_id,
+            elapsed_ms=elapsed_ms,
+            error_type=type(exc).__name__,
+        ) from exc
+
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    result = UpstreamResult(
         status_code=resp.status_code,
         headers=dict(resp.headers),
         body=resp.content,
         url=url,
+        elapsed_ms=elapsed_ms,
     )
+    logger.info(
+        "request_id=%s upstream_complete stage=%s status=%s "
+        "elapsed_ms=%s request_bytes=%s response_bytes=%s",
+        request_id,
+        stage,
+        result.status_code,
+        elapsed_ms,
+        len(body),
+        len(result.body),
+    )
+    return result
 
 
 def make_response(result: UpstreamResult, stage: str, request_id: str, settings: Settings) -> Response:

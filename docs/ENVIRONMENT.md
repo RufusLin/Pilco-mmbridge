@@ -15,6 +15,7 @@ MM_BRIDGE_HOST=127.0.0.1
 MM_BRIDGE_PORT=18000
 MM_BRIDGE_TOKEN=REPLACE_WITH_A_LONG_RANDOM_TOKEN
 MM_BRIDGE_MODEL_ID=deepseek-v4-mm-bridge
+MM_BRIDGE_MODE=1
 MM_LOG_LEVEL=INFO
 
 VLLM_ROOT_URL=http://127.0.0.1:8000
@@ -60,6 +61,7 @@ MM_WRAP_UPSTREAM_ERRORS=false
 | `MM_BRIDGE_PORT` | `18000` | `18000` | Bridge HTTP port. |
 | `MM_BRIDGE_TOKEN` | empty | A long random token | Client authentication token. An empty value disables bridge authentication. |
 | `MM_BRIDGE_MODEL_ID` | `deepseek-v4-mm-bridge` | Any stable client-facing alias | Model ID exposed by the bridge. |
+| `MM_BRIDGE_MODE` | `1` | `1` for a separate analyzer and text model | `1` analyzes current-event media before the final request. `2` skips analyzer enrichment and forwards to a multimodal main model. |
 | `MM_LOG_LEVEL` | `INFO` | `INFO` | Uvicorn log level. Use `DEBUG` only while diagnosing problems. |
 
 Generate a token locally:
@@ -99,14 +101,14 @@ x-api-key: <MM_BRIDGE_TOKEN>
 | `both` | Sends both headers. |
 | `none` | Sends no upstream authentication header. |
 
-## Vision-analyzer upstream
+## Multimodal-analyzer upstream
 
-The `LLAMA_*` names are retained for compatibility. They may point to llama.cpp or to a vision-capable vLLM server.
+The `LLAMA_*` names are retained for compatibility. They may point to llama.cpp or to a multimodal vLLM server.
 
 | Variable | Code default | Recommended value | Description |
 |---|---:|---:|---|
-| `LLAMA_ROOT_URL` | `http://127.0.0.1:8080` | Your vision-server root URL | Do not append `/v1`. |
-| `LLAMA_API_KEY` | `EMPTY` | Match the vision server | Authentication value sent to the vision analyzer. |
+| `LLAMA_ROOT_URL` | `http://127.0.0.1:8080` | Your analyzer-server root URL | Do not append `/v1`. |
+| `LLAMA_API_KEY` | `EMPTY` | Match the analyzer server | Authentication value sent to the multimodal analyzer. |
 | `LLAMA_AUTH_STYLE` | `auto` | `auto` or the exact server requirement | Uses the same allowed values as `VLLM_AUTH_STYLE`. |
 | `LLAMA_MODEL` | empty | Empty for one-model servers, explicit ID for multi-model servers | When empty, the bridge discovers the first model returned by `GET /v1/models`. |
 
@@ -145,7 +147,7 @@ Consider a higher value for long terminal output, source code, documents, or mul
 MM_ANALYZER_MAX_TOKENS=32768
 ```
 
-This variable sets a maximum, not a required output length. The vision model, its context window, and the serving configuration must support the selected value. A high token limit does not improve unreadable pixels by itself.
+This variable sets a maximum, not a required output length. The analyzer model, its context window, and the serving configuration must support the selected value. A high token limit does not improve unreadable source media by itself.
 
 ## Final-model media policy
 
@@ -160,6 +162,8 @@ Allowed values:
 | `keep` | Keeps the original media blocks after injecting the analysis. Use only when the final model and server accept media. |
 | `replace` | Replaces media blocks with text placeholders and sends the analysis as context. Recommended for text-only final models. |
 | `strip` | Removes media blocks completely and sends only the injected analysis. |
+
+If analyzer processing fails while `MM_FAIL_ON_ANALYZER_ERROR=false`, the Bridge does not apply `replace` or `strip` to an empty analysis. It forwards the original raw media to the final upstream and marks the response with `x-mm-bridge-analyzer-source: fail_open`. Only enable this when the final upstream accepts the incoming media format.
 
 ## Unsupported media endpoints
 
@@ -197,10 +201,14 @@ Allowed values:
 | `MM_MAX_BODY_BYTES` | `104857600` | Maximum complete request-body size in bytes. |
 | `MM_MAX_MEDIA_BYTES` | `52428800` | Maximum approximate size of one media item in bytes. |
 | `MM_MAX_MEDIA_ITEMS` | `8` | Maximum number of media items per request. |
-| `MM_HTTP_TIMEOUT_SECONDS` | `600` | HTTP timeout used for upstream requests. |
+| `MM_HTTP_TIMEOUT_SECONDS` | `600` | Shared HTTP timeout used for analyzer, final-model, and model-discovery upstream requests. A non-stream timeout is returned as a structured HTTP 504 with its stage and elapsed time unless analyzer fail-open is enabled. |
 | `MM_STREAM_HEARTBEAT_SECONDS` | `15` | SSE heartbeat interval. Set to `0` or less to disable heartbeat messages. |
 
 Remember that base64 media is larger than the original binary file. Reverse-proxy limits must also allow the request size and duration.
+
+The timeout remains one shared setting. `x-mm-bridge-stage` distinguishes `llama_analyzer`, `vllm_final`, and model-discovery failures; `x-mm-bridge-analyzer-source` distinguishes a fresh analyzer call from a cache hit or fail-open route. With `MM_FAIL_ON_ANALYZER_ERROR=false`, analyzer and analyzer-model-discovery timeouts/transport failures are absorbed into the raw-media `fail_open` route instead of returning 504/502. Best-effort alias-plus-upstream model listing may also absorb model-list failures.
+
+For long-running final-model generations, raise the Bridge timeout as needed and set the client timeout to the same or a larger value. This timeout controls waiting, not generation length; configure the output-token ceiling separately in the calling client.
 
 ## Debugging
 

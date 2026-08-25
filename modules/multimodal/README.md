@@ -1,12 +1,13 @@
 # `modules.multimodal`
 
-This package contains the complete MM-Bridge request pipeline: configuration loading, authentication, media detection, question-aware visual analysis, OCR evidence injection, caching, upstream forwarding, and SSE streaming.
+This package contains the complete MM-Bridge request pipeline: configuration loading, authentication, media detection, question-aware multimodal analysis, evidence injection, caching, upstream forwarding, and SSE streaming.
 
 ## Files
 
 | File | Responsibility |
 |---|---|
 | `app.py` | FastAPI application, routing, request pipeline, model discovery, debug dumps, analyzer calls, and final upstream forwarding. |
+| `analysis_contract.py` | Parses, normalizes, repairs, and validates analyzer evidence against incoming attachment metadata. |
 | `config.py` | Reads environment variables into the immutable `Settings` dataclass and defines supported policy types. |
 | `context.py` | Separates the active real-user request from the current direct-user or tool-result event so historical media is not reanalyzed. |
 | `media.py` | Finds image, audio, and video blocks; estimates media size; computes hashes; and keeps, replaces, or removes media in the final request. |
@@ -29,7 +30,11 @@ Client request
   → forward to VLLM_ROOT_URL using the original endpoint
 ```
 
-The vision analyzer is not called.
+The multimodal analyzer is not called.
+
+## Mode 2 direct forwarding
+
+When `MM_BRIDGE_MODE=2`, the bridge does not create an analyzer cache and does not inspect or transform media for enrichment. JSON requests have only the configured model-ID rewrite applied before they are forwarded to `VLLM_ROOT_URL`; non-JSON requests retain the ordinary raw-proxy behavior. The final upstream must support every media format sent by the client.
 
 ## Request flow with media
 
@@ -41,13 +46,15 @@ Client request + media
   → enforce item-count and per-item size limits
   → verify that the endpoint supports analyzer injection
   → retain the latest actual user request that started the active tool chain
-  → discover or use the vision-model ID
+  → discover or use the analyzer-model ID
   → compute a question-aware cache key
      ├─ cache hit: reuse the analysis
      └─ cache miss:
           → build_analyzer_body()
           → send media + exact user request to LLAMA_ROOT_URL
-          → extract and validate analyzer evidence JSON
+          → extract analyzer evidence JSON
+          → normalize it against the incoming attachment metadata
+          → validate the normalized contract
           → store the result in the cache
   → inject_analysis()
   → keep, replace, or strip original media
@@ -106,6 +113,21 @@ The value comes from `MM_ANALYZER_MAX_TOKENS`. The project recommends at least `
 
 The analyzer returns a single top-level `media` array. It does not return a top-level summary, candidate answer, or recommendation.
 
+Each media item represents one attached file. The Bridge owns its count,
+one-based index, and type. Panels, subfigures, charts, diagrams, page regions,
+objects, and scenes inside one image or video are represented as multiple
+evidence blocks inside that media item, not as additional media items.
+
+Supported types and containers are:
+
+| Type | Required | Optional | Forbidden |
+|---|---|---|---|
+| `image` | `text_blocks` | `visual_blocks` | `audio_blocks` |
+| `video` | `text_blocks` | `visual_blocks`, `audio_blocks` | none |
+| `audio` | `text_blocks` | `audio_blocks` | `visual_blocks` |
+
+There is no generic `media` type.
+
 ### Text blocks
 
 `text_blocks` contain verbatim OCR, speech, or lyrics. `source` identifies which kind of text was extracted, while `location` records an image position, audio time range, or video time and position.
@@ -124,7 +146,7 @@ The analyzer preserves meaningful line breaks, casing, punctuation, commands, pa
 
 ### Visual blocks
 
-Images and videos with visual content may include `visual_blocks` for UI states, document structure, tables, charts, diagrams, objects, and spatial relationships. The bridge does not assign or require a semantic `kind`; it passes the analyzer's evidence to the final model without classifying it again.
+Images and videos with visual content may include `visual_blocks` for UI states, document structure, tables, charts, diagrams, objects, and spatial relationships. A visual block has no separate semantic `kind`; the Bridge normalizes its documented fields without inventing a new classification.
 
 ```json
 {
@@ -144,7 +166,7 @@ Images and videos with visual content may include `visual_blocks` for UI states,
 
 ### Audio blocks
 
-Audio and videos with an audio track may include `audio_blocks`. Spoken words and lyrics remain in `text_blocks`; `audio_blocks` contain non-verbal sound events and supported music analysis.
+Audio and video attachments may include `audio_blocks`. Spoken words and lyrics remain in `text_blocks`; `audio_blocks` contain non-verbal sound events and supported music analysis. A video may therefore preserve visual evidence and soundtrack evidence in the same media item.
 
 ```json
 {
@@ -222,7 +244,7 @@ The injected context tells the final text model:
 ```text
 ANALYZER_PROMPT_VERSION
 endpoint
-vision-model ID
+analyzer-model ID
 media hashes
 exact user request
 ```
@@ -277,6 +299,7 @@ For SSE responses, `upstream.py`:
 - Handles compressed upstream streams safely
 - Sends comment-style heartbeat events during idle periods
 - Adds `x-mm-bridge-stage` and `x-mm-bridge-request-id` response headers
+- Adds `x-mm-bridge-analyzer-source: analyzer|cache|fail_open` to enriched final responses
 
 The heartbeat interval comes from `MM_STREAM_HEARTBEAT_SECONDS`.
 
@@ -311,16 +334,39 @@ When `MM_DEBUG_DUMP=true`, `app.py` may write files such as:
 ```text
 incoming.json
 incoming_direct.json
+incoming_media_meta.json
 llama_request.json
+analyzer_request_meta.json
 llama_response.body
-vllm_request.json
+analyzer_response_parsed.json
+analyzer_response_normalized.json
+normalization_repairs.json
+validation_result.json
+final_request_meta.json
+final_response_meta.json
 ```
 
-These files may contain user prompts, base64 media, internal URLs, analyzer output, or final model requests. Keep `.debug/` out of Git and delete debug data after diagnosis.
+The incoming/analyzer files may contain user prompts, base64 media, internal URLs, or analyzer output. Final request and response dumps are metadata-only and omit final prompt/response bodies. Keep `.debug/` out of Git and delete debug data after diagnosis.
+
+## Analyzer source and fail-open behavior
+
+For a successful mode-1 media request, inspect the final response header:
+
+```http
+x-mm-bridge-analyzer-source: analyzer
+```
+
+- `analyzer`: the Bridge called the multimodal analyzer for this request.
+- `cache`: the Bridge reused a previously normalized analysis, so no new analyzer GPU activity is expected.
+- `fail_open`: analyzer processing failed while `MM_FAIL_ON_ANALYZER_ERROR=false`; the Bridge bypassed analysis injection and media replacement, then forwarded the original raw media to the final upstream.
+
+Non-stream upstream timeouts return a structured HTTP 504 with `stage`, `request_id`, and `elapsed_ms`. When analyzer fail-open is enabled, analyzer/analyzer-discovery timeout or transport errors instead use the `fail_open` raw-media route. Best-effort model-list aggregation may also suppress an upstream list failure. Analyzer and final calls intentionally continue to use the single `MM_HTTP_TIMEOUT_SECONDS` setting.
 
 ## Current limitations
 
-- Field-level validation checks the supported evidence contract and truncation signals, but semantic OCR and visual-analysis accuracy still depends on the analyzer.
+- Recoverable missing fields, forbidden containers, wrong analyzer index/type, and single-attachment splitting are normalized before validation.
+- Multi-attachment count mismatch remains an error because the Bridge does not guess attachment correspondence.
+- Contract validation and truncation checks do not guarantee semantic OCR or visual-analysis accuracy.
 - The current implementation performs one analyzer call per cache miss.
 - There is no automatic crop, zoom, OCR retry, or second-pass inspection.
 - The vision model may still misread small or compressed text.

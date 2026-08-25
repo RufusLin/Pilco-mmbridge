@@ -77,7 +77,11 @@ def _messages_context(messages: list[Any]) -> CurrentRequestContext:
             )
         media_items = find_media_items(content)
         return CurrentRequestContext(
-            user_request_text=_text_from_content(content),
+            user_request_text=(
+                ""
+                if media_items and isinstance(content, str)
+                else _text_from_content(content)
+            ),
             event_kind="direct_user" if media_items else "text_only",
             media_items=media_items,
         )
@@ -91,7 +95,12 @@ def _messages_context(messages: list[Any]) -> CurrentRequestContext:
 
 def _responses_context(input_value: Any) -> CurrentRequestContext:
     if isinstance(input_value, str):
-        return CurrentRequestContext(input_value, "text_only", [])
+        media_items = find_media_items(input_value)
+        return CurrentRequestContext(
+            "" if media_items else input_value,
+            "direct_user" if media_items else "text_only",
+            media_items,
+        )
     if not isinstance(input_value, list):
         media_items = find_media_items(input_value)
         return CurrentRequestContext(

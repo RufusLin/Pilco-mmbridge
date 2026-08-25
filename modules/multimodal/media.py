@@ -12,6 +12,7 @@ DATA_URI_RE = re.compile(r"^data:(image|audio|video)/[a-zA-Z0-9.+-]+;base64,", r
 REMOTE_MEDIA_RE = re.compile(r"^https?://.*\.(png|jpe?g|webp|gif|bmp|mp3|wav|flac|mp4|mov|mkv|webm)(\?.*)?$", re.IGNORECASE)
 LOCAL_MEDIA_RE = re.compile(r"^file://.*\.(png|jpe?g|webp|gif|bmp|mp3|wav|flac|mp4|mov|mkv|webm)$", re.IGNORECASE)
 RAW_B64_RE = re.compile(r"^[A-Za-z0-9+/=\r\n]{200,}$")
+_REMOVE_MEDIA = object()
 
 
 @dataclass(frozen=True)
@@ -179,12 +180,14 @@ def find_media_items(value: Any) -> list[MediaItem]:
         if isinstance(node, dict):
             is_mm, kind = _detect_media_block(node)
             if is_mm:
+                if kind not in {"image", "audio", "video"}:
+                    return
                 block = copy.deepcopy(node)
                 data = canonical_json(block)
                 items.append(
                     MediaItem(
                         index=len(items) + 1,
-                        kind=kind or "media",
+                        kind=kind,
                         path=path,
                         block=block,
                         approx_bytes=_approx_block_bytes(block),
@@ -220,7 +223,9 @@ def media_summary(items: list[MediaItem]) -> str:
     lines = []
     for item in items:
         lines.append(
-            f"#{item.index}: kind={item.kind}, path={item.path or '$'}, approx_bytes={item.approx_bytes}, sha256={item.hash[:16]}"
+            f"- attachment #{item.index}: type={item.kind}, "
+            f"path={item.path or '$'}, approx_bytes={item.approx_bytes}, "
+            f"sha256={item.hash[:16]}"
         )
     return "\n".join(lines)
 
@@ -228,6 +233,9 @@ def media_summary(items: list[MediaItem]) -> str:
 def media_block_for_endpoint(item: MediaItem, endpoint: str) -> Any:
     """Convert raw MCP media content to the analyzer endpoint's official shape."""
     block = item.block
+    endpoint = endpoint.rstrip("/")
+    if isinstance(block, str):
+        return _string_media_block_for_endpoint(item.kind, block, endpoint)
     if not isinstance(block, dict):
         return copy.deepcopy(block)
     is_mcp, kind = _is_mcp_media_block(block)
@@ -235,8 +243,6 @@ def media_block_for_endpoint(item: MediaItem, endpoint: str) -> Any:
         return copy.deepcopy(block)
 
     data, mime_type = _mcp_data_and_mime(block)
-    endpoint = endpoint.rstrip("/")
-
     if endpoint == "/v1/chat/completions":
         if kind == "image":
             return {
@@ -288,6 +294,78 @@ def media_block_for_endpoint(item: MediaItem, endpoint: str) -> Any:
     return copy.deepcopy(block)
 
 
+def _string_media_block_for_endpoint(
+    kind: str,
+    value: str,
+    endpoint: str,
+) -> Any:
+    if kind not in {"image", "audio", "video"}:
+        return value
+    data_uri = _split_data_uri(value)
+
+    if endpoint == "/v1/chat/completions":
+        if kind == "image":
+            return {"type": "image_url", "image_url": {"url": value}}
+        if data_uri is not None:
+            mime_type, data = data_uri
+            details = (
+                {"data": data, "format": _audio_format(mime_type)}
+                if kind == "audio"
+                else {"data": data, "mime_type": mime_type}
+            )
+            return {"type": f"input_{kind}", f"input_{kind}": details}
+        return {
+            "type": f"input_{kind}",
+            f"input_{kind}": {"url": value},
+        }
+
+    if endpoint == "/v1/responses":
+        if kind == "image":
+            return {"type": "input_image", "image_url": value}
+        if data_uri is not None:
+            mime_type, data = data_uri
+            details = (
+                {"data": data, "format": _audio_format(mime_type)}
+                if kind == "audio"
+                else {"data": data, "mime_type": mime_type}
+            )
+            return {"type": f"input_{kind}", f"input_{kind}": details}
+        return {
+            "type": f"input_{kind}",
+            f"input_{kind}": {"url": value},
+        }
+
+    if endpoint == "/v1/messages":
+        if data_uri is not None:
+            mime_type, data = data_uri
+            return {
+                "type": kind,
+                "source": {
+                    "type": "base64",
+                    "media_type": mime_type,
+                    "data": data,
+                },
+            }
+        return {
+            "type": kind,
+            "source": {"type": "url", "url": value},
+        }
+
+    return value
+
+
+def _split_data_uri(value: str) -> tuple[str, str] | None:
+    if not value.lower().startswith("data:") or ";base64," not in value.lower():
+        return None
+    comma = value.find(",")
+    if comma < 0:
+        return None
+    mime_type = value[5:comma].split(";", 1)[0]
+    if "/" not in mime_type:
+        return None
+    return mime_type, value[comma + 1 :]
+
+
 def _mcp_data_and_mime(block: dict[str, Any]) -> tuple[str, str]:
     data = str(block["data"])
     mime_type = str(block.get("mimeType") or block.get("mime_type"))
@@ -316,21 +394,30 @@ def _audio_format(mime_type: str) -> str:
     }.get(subtype, subtype)
 
 
-def replace_or_strip_media_blocks(value: Any, policy: str, placeholder_prefix: str = "attached media") -> Any:
+def replace_or_strip_media_blocks(
+    value: Any,
+    policy: str,
+    placeholder_prefix: str = "attached media",
+    *,
+    endpoint: str | None = None,
+) -> Any:
     if policy == "keep":
         return value
+    normalized_endpoint = endpoint.rstrip("/") if endpoint else None
     counter = {"n": 0}
 
-    def transform(node: Any) -> Any:
+    def transform(node: Any, *, part_array: bool = False) -> Any:
         if isinstance(node, dict):
             is_mm, kind = _detect_media_block(node)
-            if is_mm:
+            if is_mm and kind in {"image", "audio", "video"}:
                 counter["n"] += 1
-                label = f"[{placeholder_prefix} #{counter['n']} ({kind or 'media'}): analysis is included in the system/instructions context]"
+                label = f"[{placeholder_prefix} #{counter['n']} ({kind}): analysis is included in the system/instructions context]"
                 if policy == "strip":
-                    return None
+                    return _REMOVE_MEDIA
                 # Use official text blocks for the dominant protocol shapes.
                 block_type = node.get("type")
+                if normalized_endpoint == "/v1/responses":
+                    return {"type": "input_text", "text": label}
                 if block_type in {"image_url", "input_audio", "input_video"}:
                     return {"type": "text", "text": label}
                 if block_type in {"image", "audio", "video"}:
@@ -340,17 +427,50 @@ def replace_or_strip_media_blocks(value: Any, policy: str, placeholder_prefix: s
                 return label
             out: dict[str, Any] = {}
             for k, v in node.items():
-                tv = transform(v)
-                if tv is not None:
+                child_is_part_array = (
+                    isinstance(v, list)
+                    and (
+                        k == "content"
+                        or (
+                            normalized_endpoint == "/v1/responses"
+                            and k == "input"
+                            and not any(
+                                isinstance(item, dict) and "role" in item
+                                for item in v
+                            )
+                        )
+                    )
+                )
+                tv = transform(v, part_array=child_is_part_array)
+                if tv is not _REMOVE_MEDIA:
                     out[k] = tv
             return out
         if isinstance(node, list):
             out_list = []
             for v in node:
-                tv = transform(v)
-                if tv is not None:
+                tv = transform(v, part_array=part_array)
+                if tv is not _REMOVE_MEDIA:
                     out_list.append(tv)
             return out_list
+        if isinstance(node, str):
+            kind = _detect_kind_from_url(node)
+            if kind in {"image", "audio", "video"}:
+                counter["n"] += 1
+                if policy == "strip":
+                    return _REMOVE_MEDIA
+                label = (
+                    f"[{placeholder_prefix} #{counter['n']} ({kind}): "
+                    "analysis is included in the system/instructions context]"
+                )
+                if part_array and normalized_endpoint == "/v1/responses":
+                    return {"type": "input_text", "text": label}
+                if part_array and normalized_endpoint in {
+                    "/v1/chat/completions",
+                    "/v1/messages",
+                }:
+                    return {"type": "text", "text": label}
+                return label
         return node
 
-    return transform(value)
+    transformed = transform(value)
+    return None if transformed is _REMOVE_MEDIA else transformed
