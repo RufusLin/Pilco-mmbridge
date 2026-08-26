@@ -46,6 +46,31 @@ The bridge preserves the incoming API protocol and endpoint. It does not transla
 /v1/responses        → vision /v1/responses        → text /v1/responses
 ```
 
+## MultiModal Bench Eval (MMMU)
+- DeepSeek v4 Flash(0731) + Ornith-1.5-9B-MixedInt4-AutoRound
+- DeepSeek v4 Flash(0731) : https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731
+- Ornith-1.5-9B-MixedInt4-AutoRound : https://huggingface.co/Pilcothink/Ornith-1.5-9B-MixedInt4-AutoRound
+
+### MMMU Results
+
+| Result | Correct / Evaluated | Accuracy |
+|---|---:|---:|
+| Raw `lmms-eval` result | 692 / 900 | **76.89%** |
+| Completed-sample accuracy | 679 / 848 | **80.07%** |
+
+### Recorded Token Usage
+
+| Metric | Usage |
+|---|---:|
+| Input tokens | **822,868** |
+| DeepSeek Output tokens | **1,741,570** |
+| Total tokens | **2,564,438** |
+
+The evaluation consumed approximately **2.56 million tokens** in total.
+
+A significant portion of the output-token usage came from samples that reached the generation limit. The 51 affected samples alone consumed **835,584 output tokens**, accounting for approximately **48% of all output tokens used during the evaluation**.
+
+
 ## Main features
 
 - Direct pass-through for requests without media
@@ -253,3 +278,5 @@ curl http://127.0.0.1:18000/v1/chat/completions \
 - OCR accuracy depends on image quality, text size, compression, and the vision model.
 - Evidence validation checks the supported schema and truncation signals, but it does not prove that the analyzer observed every real detail correctly.
 - Small HUD values and dense screenshots may require higher-resolution inputs or future crop/retry logic.
+
+
