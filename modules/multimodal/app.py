@@ -26,6 +26,7 @@ from .pdf import (
     PdfWorkLimiter,
     PyMuPdfExtractor,
     PyMuPdfRenderer,
+    RayPdfInterpretationProvider,
     WorkPdfExtractProvider,
     process_pdf_documents,
 )
@@ -50,6 +51,36 @@ from .upstream import (
 
 logger = logging.getLogger("mm_bridge")
 SAFE_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+_PDF_USER_MESSAGES = {
+    "pdf_queue_full": "ただいま他の文書を処理中です。少し待ってから送り直してください。",
+    "pdf_limit": "このPDFは上限を超えています（最大25MB・25ページ、または1ページあたりの画素上限）。",
+    "pdf_extract": "PDFを読み取れませんでした。ページ数を減らすか、画像として送ってください。",
+    "pdf_interpretation": "PDFの図版解析に失敗したため、見ていない内容では答えられません。",
+    "pdf_preprocessing_disabled": "現在PDFの読み取りは利用できません。",
+    "pdf_provider_unconfigured": "PDF処理が設定されていません。",
+    "pdf_upload_timeout": "アップロードが時間切れになりました。ファイルを小さくして再試行してください。",
+    "pdf_processing_timeout": "PDFの処理が時間切れになりました。ページ数を減らして再試行してください。",
+}
+
+
+def _pdf_error_response(status: int, stage: str, request_id: str, detail: str = "") -> JSONResponse:
+    return JSONResponse(
+        {
+            "error": {
+                "message": _PDF_USER_MESSAGES.get(stage, detail or stage),
+                "type": stage,
+                "code": stage,
+                "stage": stage,
+                "request_id": request_id,
+                "detail": detail,
+            }
+        },
+        status_code=status,
+        headers={
+            "x-mm-bridge-stage": stage,
+            "x-mm-bridge-request-id": request_id,
+        },
+    )
 
 
 def create_app(settings: Settings) -> FastAPI:
@@ -73,6 +104,16 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.pdf_extract_provider = (
         WorkPdfExtractProvider(url=extract_url)
         if settings.pdf_ocr_provider == "http_pdf" and extract_url
+        else None
+    )
+    app.state.pdf_interpretation_provider = (
+        RayPdfInterpretationProvider(
+            root_url=settings.llama_root_url,
+            api_key=settings.llama_api_key,
+            model=settings.llama_model,
+            max_tokens=settings.analyzer_max_tokens,
+        )
+        if settings.pdf_ocr_provider == "http_pdf" and settings.llama_root_url
         else None
     )
 
@@ -192,22 +233,8 @@ def create_app(settings: Settings) -> FastAPI:
         media_items = request_context.media_items
         document_items = [item for item in media_items if item.kind == "document"]
         if document_items and not settings.pdf_enabled:
-            return JSONResponse(
-                {
-                    "error": {
-                        "stage": "pdf_preprocessing_disabled",
-                        "message": (
-                            "PDF input is disabled until a bounded OCR provider "
-                            "and deployment limits are configured"
-                        ),
-                        "request_id": request_id,
-                    }
-                },
-                status_code=501,
-                headers={
-                    "x-mm-bridge-stage": "pdf_preprocessing_disabled",
-                    "x-mm-bridge-request-id": request_id,
-                },
+            return _pdf_error_response(
+                501, "pdf_preprocessing_disabled", request_id
             )
         pdf_evidence = ""
         if document_items and settings.pdf_enabled:
@@ -215,19 +242,8 @@ def create_app(settings: Settings) -> FastAPI:
                 settings.pdf_ocr_provider == "http_pdf"
                 and app.state.pdf_extract_provider is None
             ):
-                return JSONResponse(
-                    {
-                        "error": {
-                            "stage": "pdf_provider_unconfigured",
-                            "message": "PDF extract URL is not configured",
-                            "request_id": request_id,
-                        }
-                    },
-                    status_code=501,
-                    headers={
-                        "x-mm-bridge-stage": "pdf_provider_unconfigured",
-                        "x-mm-bridge-request-id": request_id,
-                    },
+                return _pdf_error_response(
+                    501, "pdf_provider_unconfigured", request_id
                 )
             try:
                 pdf_evidence = await process_pdf_documents(
@@ -240,51 +256,22 @@ def create_app(settings: Settings) -> FastAPI:
                     ),
                     limiter=app.state.pdf_limiter,
                     extract_provider=app.state.pdf_extract_provider,
+                    interpretation_provider=app.state.pdf_interpretation_provider,
                 )
             except PdfQueueFullError as exc:
-                return JSONResponse(
-                    {
-                        "error": {
-                            "stage": "pdf_queue_full",
-                            "message": str(exc),
-                            "request_id": request_id,
-                        }
-                    },
-                    status_code=429,
-                    headers={
-                        "x-mm-bridge-stage": "pdf_queue_full",
-                        "x-mm-bridge-request-id": request_id,
-                    },
+                return _pdf_error_response(
+                    429, "pdf_queue_full", request_id, str(exc)
                 )
             except PdfLimitError as exc:
-                return JSONResponse(
-                    {
-                        "error": {
-                            "stage": "pdf_limit",
-                            "message": str(exc),
-                            "request_id": request_id,
-                        }
-                    },
-                    status_code=413,
-                    headers={
-                        "x-mm-bridge-stage": "pdf_limit",
-                        "x-mm-bridge-request-id": request_id,
-                    },
-                )
+                return _pdf_error_response(413, "pdf_limit", request_id, str(exc))
             except PdfExtractError as exc:
-                return JSONResponse(
-                    {
-                        "error": {
-                            "stage": exc.stage,
-                            "message": str(exc),
-                            "request_id": request_id,
-                        }
-                    },
-                    status_code=exc.status_code,
-                    headers={
-                        "x-mm-bridge-stage": exc.stage,
-                        "x-mm-bridge-request-id": request_id,
-                    },
+                stage = exc.stage
+                if exc.status_code == 408:
+                    stage = "pdf_upload_timeout"
+                elif exc.status_code == 504:
+                    stage = "pdf_processing_timeout"
+                return _pdf_error_response(
+                    exc.status_code, stage, request_id, str(exc)
                 )
             media_items = [item for item in media_items if item.kind != "document"]
         if len(media_items) > settings.max_media_items:

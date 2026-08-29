@@ -427,3 +427,66 @@ def test_work_pdf_extract_provider_maps_timeout_errors():
     with pytest.raises(PdfExtractError) as exc:
         provider.extract(pdf_bytes=b"%PDF-data", filename="x.pdf", timeout_seconds=5)
     assert exc.value.status_code == 504
+
+
+def test_sparse_pdf_pages_get_ray_interpretation_without_sending_pdf_bytes():
+    item = find_media_items(_pdf_block(b"%PDF-data"))[0]
+    captured = {}
+
+    class ExtractProvider:
+        def extract(self, **kwargs):
+            return PdfProcessResult(
+                filename="report.pdf",
+                pages=[
+                    PdfPage(number=1, native_text="特許翻訳", source="native_text"),
+                    PdfPage(number=2, native_text="", source="tesseract_ocr"),
+                ],
+                ocr_pages=[
+                    PdfOcrPage(number=2, ocr_text="Patent Translation OCR TEST"),
+                ],
+            )
+
+    class Renderer:
+        def render(self, pdf_bytes, page_numbers, settings):
+            captured["page_numbers"] = page_numbers
+            captured["pdf_bytes"] = pdf_bytes
+            return {2: (b"\x89PNG-PAGE", 10, 10)}
+
+    class Interpreter:
+        def interpret(self, **kwargs):
+            captured["image_bytes"] = kwargs["image_bytes"]
+            captured["mime_type"] = kwargs["mime_type"]
+            captured["page_number"] = kwargs["page_number"]
+            return "A two-column diagram with a rising line."
+
+    class Unused:
+        def extract(self, *args, **kwargs):
+            raise AssertionError("local extractor must not run")
+
+        def ocr(self, **kwargs):
+            raise AssertionError("image OCR provider must not run")
+
+    evidence = json.loads(
+        asyncio.run(
+            process_pdf_documents(
+                [item],
+                settings=Settings(pdf_enabled=True, pdf_timeout_seconds=2),
+                extractor=Unused(),
+                renderer=Renderer(),
+                provider=Unused(),
+                limiter=PdfWorkLimiter(max_concurrency=1, max_queue=1),
+                extract_provider=ExtractProvider(),
+                interpretation_provider=Interpreter(),
+            )
+        )
+    )
+    pages = evidence["documents"][0]["pages"]
+    assert captured["page_numbers"] == [2]
+    assert captured["image_bytes"] == b"\x89PNG-PAGE"
+    assert captured["mime_type"] == "image/png"
+    assert b"%PDF" not in captured["image_bytes"]
+    assert pages[0]["interpretation"] == ""
+    assert pages[0]["source"] == "native_text"
+    assert pages[1]["ocr_text"] == "Patent Translation OCR TEST"
+    assert pages[1]["interpretation"] == "A two-column diagram with a rising line."
+    assert pages[1]["source"] == "tesseract_ocr"

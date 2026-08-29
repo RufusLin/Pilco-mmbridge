@@ -101,7 +101,6 @@ class PyMuPdfRenderer:
         scale = settings.pdf_render_dpi / 72.0
         matrix = fitz.Matrix(scale, scale)
         rendered: dict[int, tuple[bytes, int, int]] = {}
-        total_pixels = 0
         with fitz.open(stream=pdf_bytes, filetype="pdf") as document:
             for page_number in page_numbers:
                 if page_number < 1 or page_number > document.page_count:
@@ -109,11 +108,11 @@ class PyMuPdfRenderer:
                 pixmap = document.load_page(page_number - 1).get_pixmap(
                     matrix=matrix, alpha=False
                 )
-                total_pixels += pixmap.width * pixmap.height
-                if total_pixels > settings.pdf_max_rendered_pixels:
+                page_pixels = pixmap.width * pixmap.height
+                if page_pixels > settings.pdf_max_rendered_pixels:
                     raise PdfLimitError(
                         "PDF rendered pixels "
-                        f"{total_pixels} exceeds limit "
+                        f"{page_pixels} exceeds per-page limit "
                         f"{settings.pdf_max_rendered_pixels}"
                     )
                 rendered[page_number] = (
@@ -325,6 +324,82 @@ class QwenVisionPdfOcrProvider:
         )
 
 
+class RayPdfInterpretationProvider:
+    """Ray VLM interpretation for already-OCR'd sparse PDF pages."""
+
+    def __init__(
+        self,
+        *,
+        root_url: str,
+        api_key: str,
+        model: str,
+        max_tokens: int = 1024,
+        client: httpx.Client | None = None,
+    ):
+        self.root_url = root_url.rstrip("/")
+        self.api_key = api_key
+        self.model = model
+        self.max_tokens = max_tokens
+        self.client = client or httpx.Client()
+
+    def interpret(
+        self,
+        *,
+        page_number: int,
+        image_bytes: bytes,
+        mime_type: str,
+        timeout_seconds: float,
+    ) -> str:
+        image_url = (
+            f"data:{mime_type};base64,"
+            + base64.b64encode(image_bytes).decode("ascii")
+        )
+        response = self.client.post(
+            f"{self.root_url}/v1/chat/completions",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            json={
+                "model": self.model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Describe visual structure on one rendered PDF page. "
+                            "Return JSON only with interpretation covering layout, "
+                            "diagrams, tables, handwriting, and spatial relationships. "
+                            "Do not transcribe text; OCR is supplied separately. "
+                            "Do not answer the user."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": f"Rendered PDF page number: {page_number}",
+                            },
+                            {"type": "image_url", "image_url": {"url": image_url}},
+                        ],
+                    },
+                ],
+                "temperature": 0,
+                "max_tokens": self.max_tokens,
+                "response_format": {"type": "json_object"},
+                "stream": False,
+            },
+            timeout=timeout_seconds,
+        )
+        if response.status_code >= 400:
+            raise PdfExtractError(
+                response.text or response.reason_phrase,
+                status_code=502,
+                stage="pdf_interpretation",
+            )
+        payload = response.json()
+        text = payload["choices"][0]["message"]["content"]
+        parsed = json.loads(text) if isinstance(text, str) else text
+        return str((parsed or {}).get("interpretation") or "")
+
+
 def enforce_pdf_limits(
     *,
     pdf_bytes: bytes,
@@ -463,6 +538,7 @@ async def process_pdf_documents(
     provider: PdfOcrProvider,
     limiter: PdfWorkLimiter,
     extract_provider: WorkPdfExtractProvider | None = None,
+    interpretation_provider: RayPdfInterpretationProvider | None = None,
 ) -> str:
     async with limiter.slot():
         results: list[dict] = []
@@ -474,10 +550,13 @@ async def process_pdf_documents(
             if extract_provider is not None:
                 result = await asyncio.wait_for(
                     asyncio.to_thread(
-                        extract_provider.extract,
+                        _extract_and_interpret,
                         pdf_bytes=raw,
                         filename=filename,
-                        timeout_seconds=settings.pdf_ocr_timeout_seconds,
+                        settings=settings,
+                        extract_provider=extract_provider,
+                        renderer=renderer,
+                        interpretation_provider=interpretation_provider,
                     ),
                     timeout=settings.pdf_timeout_seconds,
                 )
@@ -500,3 +579,49 @@ async def process_pdf_documents(
             ensure_ascii=False,
             separators=(",", ":"),
         )
+
+
+def _extract_and_interpret(
+    *,
+    pdf_bytes: bytes,
+    filename: str,
+    settings: Settings,
+    extract_provider: WorkPdfExtractProvider,
+    renderer: PdfRenderer,
+    interpretation_provider: RayPdfInterpretationProvider | None,
+) -> PdfProcessResult:
+    result = extract_provider.extract(
+        pdf_bytes=pdf_bytes,
+        filename=filename,
+        timeout_seconds=settings.pdf_ocr_timeout_seconds,
+    )
+    sparse = [page.number for page in result.pages if page.source == "tesseract_ocr"]
+    if not sparse or interpretation_provider is None:
+        return result
+    rendered = renderer.render(pdf_bytes, sparse, settings)
+    ocr_by_page = {page.number: page for page in result.ocr_pages}
+    merged: list[PdfOcrPage] = []
+    seen: set[int] = set()
+    for number in sparse:
+        image_bytes, _, _ = rendered[number]
+        interpretation = interpretation_provider.interpret(
+            page_number=number,
+            image_bytes=image_bytes,
+            mime_type="image/png",
+            timeout_seconds=settings.pdf_ocr_timeout_seconds,
+        )
+        existing = ocr_by_page.get(number)
+        merged.append(
+            PdfOcrPage(
+                number=number,
+                ocr_text=existing.ocr_text if existing else "",
+                interpretation=interpretation,
+            )
+        )
+        seen.add(number)
+    for page in result.ocr_pages:
+        if page.number not in seen:
+            merged.append(page)
+    return PdfProcessResult(
+        filename=result.filename, pages=result.pages, ocr_pages=merged
+    )
