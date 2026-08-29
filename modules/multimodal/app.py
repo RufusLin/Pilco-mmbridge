@@ -167,6 +167,25 @@ def create_app(settings: Settings) -> FastAPI:
         assert cache is not None
         request_context = extract_current_request_context(body, endpoint)
         media_items = request_context.media_items
+        document_items = [item for item in media_items if item.kind == "document"]
+        if document_items and not settings.pdf_enabled:
+            return JSONResponse(
+                {
+                    "error": {
+                        "stage": "pdf_preprocessing_disabled",
+                        "message": (
+                            "PDF input is disabled until a bounded OCR provider "
+                            "and deployment limits are configured"
+                        ),
+                        "request_id": request_id,
+                    }
+                },
+                status_code=501,
+                headers={
+                    "x-mm-bridge-stage": "pdf_preprocessing_disabled",
+                    "x-mm-bridge-request-id": request_id,
+                },
+            )
         if len(media_items) > settings.max_media_items:
             raise HTTPException(
                 status_code=413,

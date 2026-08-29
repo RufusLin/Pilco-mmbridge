@@ -44,6 +44,7 @@ AuthStyle = Literal["auto", "bearer", "x-api-key", "both", "none"]
 MediaPolicy = Literal["keep", "replace", "strip"]
 UnsupportedMediaPolicy = Literal["passthrough", "error"]
 ModelsPolicy = Literal["alias_plus_upstream", "alias_only", "upstream_only", "passthrough"]
+PdfOcrProvider = Literal["disabled", "qwen_vision", "http"]
 
 
 @dataclass(frozen=True)
@@ -88,6 +89,23 @@ class Settings:
     max_media_items: int = 8
     http_timeout_seconds: float = 600.0
 
+    # PDF preprocessing is opt-in. Native text is extracted locally; only
+    # rendered images of text-poor pages may reach the configured OCR provider.
+    pdf_enabled: bool = False
+    pdf_max_bytes: int = 25_000_000
+    pdf_max_pages: int = 100
+    pdf_max_rendered_pixels: int = 100_000_000
+    pdf_min_native_text_chars: int = 40
+    pdf_render_dpi: int = 144
+    pdf_timeout_seconds: float = 120.0
+    pdf_ocr_timeout_seconds: float = 60.0
+    pdf_max_concurrency: int = 1
+    pdf_max_queue: int = 2
+    pdf_ocr_provider: PdfOcrProvider = "disabled"
+    pdf_ocr_url: str = ""
+    pdf_ocr_api_key: str = ""
+    pdf_ocr_model: str = ""
+
     # Cloudflare/Nginx가 장시간 아무 데이터도 없는 SSE 연결을
     # 종료하지 않도록 보내는 heartbeat 주기.
     # 0 이하로 설정하면 heartbeat를 비활성화한다.
@@ -130,6 +148,20 @@ class Settings:
             max_media_bytes=_int("MM_MAX_MEDIA_BYTES", 52_428_800),
             max_media_items=_int("MM_MAX_MEDIA_ITEMS", 8),
             http_timeout_seconds=_float("MM_HTTP_TIMEOUT_SECONDS", 600.0),
+            pdf_enabled=_bool("MM_PDF_ENABLED", False),
+            pdf_max_bytes=_int("MM_PDF_MAX_BYTES", 25_000_000),
+            pdf_max_pages=_int("MM_PDF_MAX_PAGES", 100),
+            pdf_max_rendered_pixels=_int("MM_PDF_MAX_RENDERED_PIXELS", 100_000_000),
+            pdf_min_native_text_chars=_int("MM_PDF_MIN_NATIVE_TEXT_CHARS", 40),
+            pdf_render_dpi=_int("MM_PDF_RENDER_DPI", 144),
+            pdf_timeout_seconds=_float("MM_PDF_TIMEOUT_SECONDS", 120.0),
+            pdf_ocr_timeout_seconds=_float("MM_PDF_OCR_TIMEOUT_SECONDS", 60.0),
+            pdf_max_concurrency=_int("MM_PDF_MAX_CONCURRENCY", 1),
+            pdf_max_queue=_int("MM_PDF_MAX_QUEUE", 2),
+            pdf_ocr_provider=os.getenv("MM_PDF_OCR_PROVIDER", "disabled"),  # type: ignore[arg-type]
+            pdf_ocr_url=_root_url(os.getenv("MM_PDF_OCR_URL", "")),
+            pdf_ocr_api_key=os.getenv("MM_PDF_OCR_API_KEY", ""),
+            pdf_ocr_model=os.getenv("MM_PDF_OCR_MODEL", ""),
             stream_heartbeat_seconds=_float("MM_STREAM_HEARTBEAT_SECONDS", 15.0),
             debug_dump=_bool("MM_DEBUG_DUMP", False),
             debug_dump_dir=os.getenv("MM_DEBUG_DUMP_DIR", ".debug/mm_bridge"),

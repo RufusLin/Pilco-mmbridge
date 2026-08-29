@@ -210,6 +210,41 @@ The timeout remains one shared setting. `x-mm-bridge-stage` distinguishes `llama
 
 For long-running final-model generations, raise the Bridge timeout as needed and set the client timeout to the same or a larger value. This timeout controls waiting, not generation length; configure the output-token ceiling separately in the calling client.
 
+## PDF preprocessing
+
+PDF handling is disabled by default. When enabled, MM-Bridge extracts native
+text locally, page by page; only pages below `MM_PDF_MIN_NATIVE_TEXT_CHARS` are
+rasterized. The OCR provider boundary accepts rendered page images only, never
+raw PDF bytes. Evidence preserves `page_number` and keeps `native_text`,
+`ocr_text`, and `interpretation` in separate fields.
+
+The deployment must set and test every limit before enabling PDFs:
+
+```env
+MM_PDF_ENABLED=false
+MM_PDF_MAX_BYTES=25000000
+MM_PDF_MAX_PAGES=100
+MM_PDF_MAX_RENDERED_PIXELS=100000000
+MM_PDF_MIN_NATIVE_TEXT_CHARS=40
+MM_PDF_RENDER_DPI=144
+MM_PDF_TIMEOUT_SECONDS=120
+MM_PDF_OCR_TIMEOUT_SECONDS=60
+MM_PDF_MAX_CONCURRENCY=1
+MM_PDF_MAX_QUEUE=2
+MM_PDF_OCR_PROVIDER=disabled
+MM_PDF_OCR_URL=
+MM_PDF_OCR_API_KEY=
+MM_PDF_OCR_MODEL=
+```
+
+`qwen_vision` targets an OpenAI-compatible vision server. `http` targets a
+backend-neutral OCR service such as bounded Tika/Tesseract. Provider hosts and
+deployment limits are configuration, not source constants.
+
+Limits are checked before OCR: decoded size, page count, cumulative rendered
+pixels, bounded queue/concurrency, then provider timeout. Provider payloads
+contain only the page number, MIME type, and base64 rendered page image.
+
 ## Debugging
 
 | Variable | Code default | Production recommendation | Description |

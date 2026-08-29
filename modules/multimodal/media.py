@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 DATA_URI_RE = re.compile(r"^data:(image|audio|video)/[a-zA-Z0-9.+-]+;base64,", re.IGNORECASE)
+PDF_DATA_URI_RE = re.compile(r"^data:application/pdf;base64,", re.IGNORECASE)
 REMOTE_MEDIA_RE = re.compile(r"^https?://.*\.(png|jpe?g|webp|gif|bmp|mp3|wav|flac|mp4|mov|mkv|webm)(\?.*)?$", re.IGNORECASE)
 LOCAL_MEDIA_RE = re.compile(r"^file://.*\.(png|jpe?g|webp|gif|bmp|mp3|wav|flac|mp4|mov|mkv|webm)$", re.IGNORECASE)
 RAW_B64_RE = re.compile(r"^[A-Za-z0-9+/=\r\n]{200,}$")
@@ -23,6 +24,8 @@ class MediaItem:
     block: Any
     approx_bytes: int
     hash: str
+    mime_type: str = ""
+    filename: str = ""
 
 
 def canonical_json(value: Any) -> bytes:
@@ -91,6 +94,18 @@ def _is_openai_media_block(obj: dict[str, Any]) -> tuple[bool, str | None]:
         return True, "audio"
     if t == "input_video":
         return True, "video"
+    if t in {"file", "input_file"}:
+        nested_file = obj.get("file")
+        file_obj: dict[str, Any] = nested_file if isinstance(nested_file, dict) else obj
+        data = file_obj.get("file_data") or file_obj.get("data")
+        mime = file_obj.get("mime_type") or file_obj.get("media_type")
+        name = file_obj.get("filename") or obj.get("filename") or ""
+        if (
+            (isinstance(data, str) and PDF_DATA_URI_RE.match(data))
+            or mime == "application/pdf"
+            or str(name).lower().endswith(".pdf")
+        ):
+            return True, "document"
     return False, None
 
 
@@ -107,6 +122,9 @@ def _is_anthropic_media_block(obj: dict[str, Any]) -> tuple[bool, str]:
 
     if t in {"image", "audio", "video"} and isinstance(obj.get("source"), dict):
         return True, t
+    if t == "document" and isinstance(obj.get("source"), dict):
+        if obj["source"].get("media_type") == "application/pdf":
+            return True, "document"
 
     return False, ""
 
@@ -141,6 +159,14 @@ def _approx_block_bytes(block: Any) -> int:
         is_mcp, _ = _is_mcp_media_block(block)
         if is_mcp:
             return _size_of_url_or_b64(block["data"])
+        if block.get("type") in {"file", "input_file", "document"}:
+            nested_file = block.get("file")
+            file_obj: dict[str, Any] = nested_file if isinstance(nested_file, dict) else block
+            nested_source = block.get("source")
+            source: dict[str, Any] = nested_source if isinstance(nested_source, dict) else {}
+            data = file_obj.get("file_data") or file_obj.get("data") or source.get("data")
+            if isinstance(data, str):
+                return _size_of_url_or_b64(data)
         # Official OpenAI Chat multimedia fields.
         if block.get("type") == "image_url" and isinstance(block.get("image_url"), dict):
             url = block["image_url"].get("url")
@@ -155,9 +181,9 @@ def _approx_block_bytes(block: Any) -> int:
             if isinstance(src, str):
                 return _size_of_url_or_b64(src)
         # Anthropic source block.
-        source = block.get("source")
-        if isinstance(source, dict):
-            src = source.get("data") or source.get("url")
+        anthropic_source = block.get("source")
+        if isinstance(anthropic_source, dict):
+            src = anthropic_source.get("data") or anthropic_source.get("url")
             if isinstance(src, str):
                 return _size_of_url_or_b64(src)
         # Responses-style blocks.
@@ -180,10 +206,13 @@ def find_media_items(value: Any) -> list[MediaItem]:
         if isinstance(node, dict):
             is_mm, kind = _detect_media_block(node)
             if is_mm:
-                if kind not in {"image", "audio", "video"}:
+                if kind not in {"image", "audio", "video", "document"}:
                     return
                 block = copy.deepcopy(node)
                 data = canonical_json(block)
+                mime_type, filename = (
+                    _document_metadata(block) if kind == "document" else ("", "")
+                )
                 items.append(
                     MediaItem(
                         index=len(items) + 1,
@@ -192,6 +221,8 @@ def find_media_items(value: Any) -> list[MediaItem]:
                         block=block,
                         approx_bytes=_approx_block_bytes(block),
                         hash=sha256_text(data),
+                        mime_type=mime_type,
+                        filename=filename,
                     )
                 )
                 return
@@ -228,6 +259,26 @@ def media_summary(items: list[MediaItem]) -> str:
             f"sha256={item.hash[:16]}"
         )
     return "\n".join(lines)
+
+
+def _document_metadata(block: dict[str, Any]) -> tuple[str, str]:
+    nested_file = block.get("file")
+    file_obj: dict[str, Any] = nested_file if isinstance(nested_file, dict) else block
+    nested_source = block.get("source")
+    source: dict[str, Any] = nested_source if isinstance(nested_source, dict) else {}
+    filename = str(
+        file_obj.get("filename")
+        or block.get("filename")
+        or source.get("filename")
+        or "document.pdf"
+    )
+    mime_type = str(
+        file_obj.get("mime_type")
+        or file_obj.get("media_type")
+        or source.get("media_type")
+        or "application/pdf"
+    )
+    return mime_type, filename
 
 
 def media_block_for_endpoint(item: MediaItem, endpoint: str) -> Any:
@@ -409,7 +460,7 @@ def replace_or_strip_media_blocks(
     def transform(node: Any, *, part_array: bool = False) -> Any:
         if isinstance(node, dict):
             is_mm, kind = _detect_media_block(node)
-            if is_mm and kind in {"image", "audio", "video"}:
+            if is_mm and kind in {"image", "audio", "video", "document"}:
                 counter["n"] += 1
                 label = f"[{placeholder_prefix} #{counter['n']} ({kind}): analysis is included in the system/instructions context]"
                 if policy == "strip":

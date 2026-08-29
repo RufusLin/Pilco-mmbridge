@@ -277,6 +277,21 @@ curl http://127.0.0.1:18000/v1/chat/completions \
 
 ## Important limitations
 
+### PDF preprocessing extension
+
+This fork includes an opt-in, backend-pluggable PDF preprocessing core. PDFs
+are disabled and rejected before any upstream call unless explicitly enabled.
+Native text is extracted locally per page; only text-poor pages are rendered.
+Raw PDF bytes cannot cross the OCR provider interface. Evidence preserves page
+numbers and separates native text, OCR text, and model interpretation.
+
+Two OCR provider interfaces are available: OpenAI-compatible Qwen vision and a
+backend-neutral HTTP provider suitable for a bounded Tika/Tesseract service.
+Endpoint and deployment limits remain environment configuration; see
+`docs/ENVIRONMENT.md`. Queue, concurrency, file-size, page-count,
+rendered-pixel, and timeout limits are represented in the PDF pipeline and
+covered by tests.
+
 - The final text model does not receive visual tokens directly.
 - Visual information omitted by the analyzer cannot be reconstructed by the text model.
 - OCR accuracy depends on image quality, text size, compression, and the vision model.
