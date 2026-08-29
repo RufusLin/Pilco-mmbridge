@@ -109,6 +109,7 @@ The `LLAMA_*` names are retained for compatibility. They may point to llama.cpp 
 |---|---:|---:|---|
 | `LLAMA_ROOT_URL` | `http://127.0.0.1:8080` | Your analyzer-server root URL | Do not append `/v1`. |
 | `LLAMA_API_KEY` | `EMPTY` | Match the analyzer server | Authentication value sent to the multimodal analyzer. |
+| `LLAMA_API_KEY_FILE` | empty | A mode-0600 mounted secret file | Overrides `LLAMA_API_KEY`; preferred for containers and system services. |
 | `LLAMA_AUTH_STYLE` | `auto` | `auto` or the exact server requirement | Uses the same allowed values as `VLLM_AUTH_STYLE`. |
 | `LLAMA_MODEL` | empty | Empty for one-model servers, explicit ID for multi-model servers | When empty, the bridge discovers the first model returned by `GET /v1/models`. |
 

@@ -40,6 +40,14 @@ def _root_url(value: str) -> str:
     return value.rstrip("/")
 
 
+def _secret(name: str, default: str = "") -> str:
+    path = os.getenv(f"{name}_FILE", "").strip()
+    if path:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read().strip()
+    return os.getenv(name, default)
+
+
 AuthStyle = Literal["auto", "bearer", "x-api-key", "both", "none"]
 MediaPolicy = Literal["keep", "replace", "strip"]
 UnsupportedMediaPolicy = Literal["passthrough", "error"]
@@ -125,11 +133,11 @@ class Settings:
             bridge_mode=_int("MM_BRIDGE_MODE", 1),
             log_level=os.getenv("MM_LOG_LEVEL", "INFO"),
             vllm_root_url=_root_url(os.getenv("VLLM_ROOT_URL", os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8000"))),
-            vllm_api_key=os.getenv("VLLM_API_KEY", "EMPTY"),
+            vllm_api_key=_secret("VLLM_API_KEY", "EMPTY"),
             vllm_auth_style=os.getenv("VLLM_AUTH_STYLE", "auto"),  # type: ignore[arg-type]
             vllm_model=os.getenv("VLLM_MODEL", ""),
             llama_root_url=_root_url(os.getenv("LLAMA_ROOT_URL", os.getenv("JETSON_LLAMA_BASE_URL", "http://127.0.0.1:8080"))),
-            llama_api_key=os.getenv("LLAMA_API_KEY", os.getenv("JETSON_LLAMA_API_KEY", "EMPTY")),
+            llama_api_key=_secret("LLAMA_API_KEY", os.getenv("JETSON_LLAMA_API_KEY", "EMPTY")),
             llama_auth_style=os.getenv("LLAMA_AUTH_STYLE", "auto"),  # type: ignore[arg-type]
             llama_model=os.getenv("LLAMA_MODEL", os.getenv("JETSON_LLAMA_MODEL", "")),
             analyzer_endpoints=_csv("MM_ANALYZER_ENDPOINTS", ["/v1/chat/completions", "/v1/messages", "/v1/responses"]),
@@ -160,7 +168,7 @@ class Settings:
             pdf_max_queue=_int("MM_PDF_MAX_QUEUE", 2),
             pdf_ocr_provider=os.getenv("MM_PDF_OCR_PROVIDER", "disabled"),  # type: ignore[arg-type]
             pdf_ocr_url=_root_url(os.getenv("MM_PDF_OCR_URL", "")),
-            pdf_ocr_api_key=os.getenv("MM_PDF_OCR_API_KEY", ""),
+            pdf_ocr_api_key=_secret("MM_PDF_OCR_API_KEY", ""),
             pdf_ocr_model=os.getenv("MM_PDF_OCR_MODEL", ""),
             stream_heartbeat_seconds=_float("MM_STREAM_HEARTBEAT_SECONDS", 15.0),
             debug_dump=_bool("MM_DEBUG_DUMP", False),

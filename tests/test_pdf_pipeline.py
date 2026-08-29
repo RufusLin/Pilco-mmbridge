@@ -256,6 +256,15 @@ def test_pdf_provider_url_is_optional_until_manus_supplies_endpoint(monkeypatch)
     assert settings.pdf_ocr_url == ""
 
 
+def test_llama_api_key_can_be_loaded_from_secret_file(tmp_path, monkeypatch):
+    secret = tmp_path / "ray-key"
+    secret.write_text("secret-from-file\n")
+    monkeypatch.setenv("LLAMA_API_KEY", "wrong-env-value")
+    monkeypatch.setenv("LLAMA_API_KEY_FILE", str(secret))
+    settings = Settings.from_env()
+    assert settings.llama_api_key == "secret-from-file"
+
+
 def test_work_limiter_rejects_above_bounded_queue():
     async def scenario():
         limiter = PdfWorkLimiter(max_concurrency=1, max_queue=1)
