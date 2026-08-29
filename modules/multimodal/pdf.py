@@ -227,7 +227,7 @@ class WorkPdfExtractProvider:
                 response.text or response.reason_phrase,
                 status_code=response.status_code,
             )
-        if response.status_code in {413, 415}:
+        if response.status_code in {413, 415, 422}:
             raise PdfLimitError(response.text or response.reason_phrase)
         if response.status_code >= 400:
             raise PdfExtractError(
