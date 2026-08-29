@@ -13,6 +13,8 @@ from modules.multimodal.pdf import (
     PyMuPdfExtractor,
     PyMuPdfRenderer,
     QwenVisionPdfOcrProvider,
+    WorkPdfExtractProvider,
+    PdfExtractError,
     PdfLimitError,
     PdfQueueFullError,
     PdfOcrPage,
@@ -96,8 +98,8 @@ def test_pdf_evidence_preserves_page_numbers_and_separates_text_from_interpretat
     evidence = json.loads(build_pdf_evidence(result))
     assert evidence["document"]["filename"] == "report.pdf"
     assert evidence["document"]["pages"] == [
-        {"page_number": 1, "native_text": "Native page one", "ocr_text": "", "interpretation": ""},
-        {"page_number": 2, "native_text": "", "ocr_text": "OCR page two", "interpretation": "A chart rises."},
+        {"page_number": 1, "native_text": "Native page one", "ocr_text": "", "interpretation": "", "source": ""},
+        {"page_number": 2, "native_text": "", "ocr_text": "OCR page two", "interpretation": "A chart rises.", "source": ""},
     ]
 
 
@@ -332,4 +334,96 @@ def test_process_pdf_documents_returns_page_numbered_evidence():
         "native_text": "native",
         "ocr_text": "",
         "interpretation": "",
+        "source": "",
     }
+
+
+def test_work_pdf_extract_provider_posts_raw_pdf_bytes_not_images():
+    captured = {}
+
+    def transport(request):
+        captured["url"] = str(request.url)
+        captured["content_type"] = request.headers["content-type"]
+        captured["body"] = request.content
+        return httpx.Response(
+            200,
+            json={
+                "status": "ok",
+                "pages": [
+                    {
+                        "page": 1,
+                        "source": "native_text",
+                        "native_text": "特許翻訳",
+                        "ocr_text": "",
+                        "interpretation": None,
+                        "rendered_pixels": 0,
+                    },
+                    {
+                        "page": 2,
+                        "source": "tesseract_ocr",
+                        "native_text": "",
+                        "ocr_text": "Patent Translation OCR TEST",
+                        "interpretation": None,
+                        "rendered_pixels": 3825000,
+                    },
+                ],
+                "native_text": "特許翻訳",
+                "ocr_text": "Patent Translation OCR TEST",
+                "interpretation": None,
+            },
+        )
+
+    import httpx
+
+    provider = WorkPdfExtractProvider(
+        url="http://ocr.internal/v1/extract",
+        client=httpx.Client(transport=httpx.MockTransport(transport)),
+    )
+    result = provider.extract(
+        pdf_bytes=b"%PDF-data",
+        filename="report.pdf",
+        timeout_seconds=5,
+    )
+    assert captured["url"] == "http://ocr.internal/v1/extract"
+    assert captured["content_type"] == "application/pdf"
+    assert captured["body"] == b"%PDF-data"
+    evidence = json.loads(build_pdf_evidence(result))["document"]["pages"]
+    assert evidence[0] == {
+        "page_number": 1,
+        "native_text": "特許翻訳",
+        "ocr_text": "",
+        "interpretation": "",
+        "source": "native_text",
+    }
+    assert evidence[1]["ocr_text"] == "Patent Translation OCR TEST"
+    assert evidence[1]["interpretation"] == ""
+    assert evidence[1]["source"] == "tesseract_ocr"
+
+
+def test_work_pdf_extract_provider_maps_backpressure_errors():
+    import httpx
+
+    def transport(request):
+        return httpx.Response(429, json={"error": "queue_full"})
+
+    provider = WorkPdfExtractProvider(
+        url="http://ocr.internal/v1/extract",
+        client=httpx.Client(transport=httpx.MockTransport(transport)),
+    )
+    with pytest.raises(PdfQueueFullError):
+        provider.extract(pdf_bytes=b"%PDF-data", filename="x.pdf", timeout_seconds=5)
+
+
+def test_work_pdf_extract_provider_maps_timeout_errors():
+    import httpx
+
+    def transport(request):
+        return httpx.Response(504, json={"error": "processing_timeout"})
+
+    provider = WorkPdfExtractProvider(
+        url="http://ocr.internal/v1/extract",
+        client=httpx.Client(transport=httpx.MockTransport(transport)),
+    )
+    with pytest.raises(PdfExtractError) as exc:
+        provider.extract(pdf_bytes=b"%PDF-data", filename="x.pdf", timeout_seconds=5)
+    assert exc.value.status_code == 504

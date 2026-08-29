@@ -52,7 +52,7 @@ AuthStyle = Literal["auto", "bearer", "x-api-key", "both", "none"]
 MediaPolicy = Literal["keep", "replace", "strip"]
 UnsupportedMediaPolicy = Literal["passthrough", "error"]
 ModelsPolicy = Literal["alias_plus_upstream", "alias_only", "upstream_only", "passthrough"]
-PdfOcrProvider = Literal["disabled", "qwen_vision", "http"]
+PdfOcrProvider = Literal["disabled", "qwen_vision", "http", "http_pdf"]
 
 
 @dataclass(frozen=True)

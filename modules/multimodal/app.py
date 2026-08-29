@@ -18,6 +18,17 @@ from .cache import AnalysisCache, make_cache_key
 from .config import Settings
 from .context import extract_current_request_context
 from .media import MediaItem, replace_or_strip_media_blocks
+from .pdf import (
+    HttpPdfOcrProvider,
+    PdfExtractError,
+    PdfLimitError,
+    PdfQueueFullError,
+    PdfWorkLimiter,
+    PyMuPdfExtractor,
+    PyMuPdfRenderer,
+    WorkPdfExtractProvider,
+    process_pdf_documents,
+)
 from .prompting import (
     analyzer_truncation_reason,
     build_analyzer_body,
@@ -52,6 +63,18 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.settings = settings
     app.state.http_client = client
     app.state.cache = cache
+    app.state.pdf_limiter = PdfWorkLimiter(
+        max_concurrency=settings.pdf_max_concurrency,
+        max_queue=settings.pdf_max_queue,
+    )
+    extract_url = (
+        f"{settings.pdf_ocr_url.rstrip('/')}/v1/extract" if settings.pdf_ocr_url else ""
+    )
+    app.state.pdf_extract_provider = (
+        WorkPdfExtractProvider(url=extract_url)
+        if settings.pdf_ocr_provider == "http_pdf" and extract_url
+        else None
+    )
 
     @app.on_event("shutdown")
     async def _shutdown() -> None:
@@ -186,6 +209,84 @@ def create_app(settings: Settings) -> FastAPI:
                     "x-mm-bridge-request-id": request_id,
                 },
             )
+        pdf_evidence = ""
+        if document_items and settings.pdf_enabled:
+            if (
+                settings.pdf_ocr_provider == "http_pdf"
+                and app.state.pdf_extract_provider is None
+            ):
+                return JSONResponse(
+                    {
+                        "error": {
+                            "stage": "pdf_provider_unconfigured",
+                            "message": "PDF extract URL is not configured",
+                            "request_id": request_id,
+                        }
+                    },
+                    status_code=501,
+                    headers={
+                        "x-mm-bridge-stage": "pdf_provider_unconfigured",
+                        "x-mm-bridge-request-id": request_id,
+                    },
+                )
+            try:
+                pdf_evidence = await process_pdf_documents(
+                    document_items,
+                    settings=settings,
+                    extractor=PyMuPdfExtractor(),
+                    renderer=PyMuPdfRenderer(),
+                    provider=HttpPdfOcrProvider(
+                        url=settings.pdf_ocr_url or "http://127.0.0.1/invalid"
+                    ),
+                    limiter=app.state.pdf_limiter,
+                    extract_provider=app.state.pdf_extract_provider,
+                )
+            except PdfQueueFullError as exc:
+                return JSONResponse(
+                    {
+                        "error": {
+                            "stage": "pdf_queue_full",
+                            "message": str(exc),
+                            "request_id": request_id,
+                        }
+                    },
+                    status_code=429,
+                    headers={
+                        "x-mm-bridge-stage": "pdf_queue_full",
+                        "x-mm-bridge-request-id": request_id,
+                    },
+                )
+            except PdfLimitError as exc:
+                return JSONResponse(
+                    {
+                        "error": {
+                            "stage": "pdf_limit",
+                            "message": str(exc),
+                            "request_id": request_id,
+                        }
+                    },
+                    status_code=413,
+                    headers={
+                        "x-mm-bridge-stage": "pdf_limit",
+                        "x-mm-bridge-request-id": request_id,
+                    },
+                )
+            except PdfExtractError as exc:
+                return JSONResponse(
+                    {
+                        "error": {
+                            "stage": exc.stage,
+                            "message": str(exc),
+                            "request_id": request_id,
+                        }
+                    },
+                    status_code=exc.status_code,
+                    headers={
+                        "x-mm-bridge-stage": exc.stage,
+                        "x-mm-bridge-request-id": request_id,
+                    },
+                )
+            media_items = [item for item in media_items if item.kind != "document"]
         if len(media_items) > settings.max_media_items:
             raise HTTPException(
                 status_code=413,
@@ -210,6 +311,28 @@ def create_app(settings: Settings) -> FastAPI:
                 )
 
         if not media_items:
+            if pdf_evidence:
+                final_body = inject_analysis(
+                    body,
+                    endpoint.rstrip("/"),
+                    pdf_evidence,
+                    settings,
+                )
+                final_body = rewrite_model(
+                    final_body,
+                    await _vllm_model(settings, client, request_id),
+                    settings.bridge_model_id,
+                    settings.rewrite_bridge_model_only,
+                )
+                return await _forward_json_to_vllm(
+                    request,
+                    settings,
+                    client,
+                    request_id,
+                    _json_bytes(final_body),
+                    stage="vllm_final",
+                    analyzer_source="pdf_extract",
+                )
             final_body = replace_or_strip_media_blocks(body, "strip")
             final_body = rewrite_model(final_body, await _vllm_model(settings, client, request_id), settings.bridge_model_id, settings.rewrite_bridge_model_only)
             final_bytes = _json_bytes(final_body)
@@ -449,6 +572,25 @@ def create_app(settings: Settings) -> FastAPI:
                         },
                     )
 
+        if fail_open and document_items:
+            return JSONResponse(
+                {
+                    "error": {
+                        "stage": "llama_analyzer",
+                        "message": "visual analysis failed; refusing to send unseen PDF content to the text model",
+                        "request_id": request_id,
+                    }
+                },
+                status_code=502,
+                headers={
+                    "x-mm-bridge-stage": "llama_analyzer",
+                    "x-mm-bridge-request-id": request_id,
+                },
+            )
+        if pdf_evidence:
+            analysis_text = "\n\n".join(
+                part for part in (pdf_evidence, analysis_text or "") if part
+            )
         if fail_open:
             final_body = copy.deepcopy(body)
         else:

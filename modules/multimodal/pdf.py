@@ -21,10 +21,18 @@ class PdfQueueFullError(RuntimeError):
     pass
 
 
+class PdfExtractError(RuntimeError):
+    def __init__(self, message: str, *, status_code: int = 502, stage: str = "pdf_extract"):
+        super().__init__(message)
+        self.status_code = status_code
+        self.stage = stage
+
+
 @dataclass(frozen=True)
 class PdfPage:
     number: int
     native_text: str
+    source: str = ""
 
 
 @dataclass(frozen=True)
@@ -182,6 +190,65 @@ class HttpPdfOcrProvider:
             ocr_text=str(payload.get("ocr_text") or ""),
             interpretation=str(payload.get("interpretation") or ""),
         )
+
+
+class WorkPdfExtractProvider:
+    """Document-evidence client for the work-host /v1/extract service.
+
+    The request body is raw PDF bytes. This provider never asks the OCR
+    service to interpret images, and it never copies interpretation from OCR.
+    """
+
+    def __init__(
+        self,
+        *,
+        url: str,
+        client: httpx.Client | None = None,
+    ):
+        self.url = url
+        self.client = client or httpx.Client()
+
+    def extract(
+        self,
+        *,
+        pdf_bytes: bytes,
+        filename: str,
+        timeout_seconds: float,
+    ) -> PdfProcessResult:
+        response = self.client.post(
+            self.url,
+            headers={"Content-Type": "application/pdf"},
+            content=pdf_bytes,
+            timeout=timeout_seconds,
+        )
+        if response.status_code == 429:
+            raise PdfQueueFullError("PDF work queue is full")
+        if response.status_code in {408, 504}:
+            raise PdfExtractError(
+                response.text or response.reason_phrase,
+                status_code=response.status_code,
+            )
+        if response.status_code in {413, 415}:
+            raise PdfLimitError(response.text or response.reason_phrase)
+        if response.status_code >= 400:
+            raise PdfExtractError(
+                response.text or response.reason_phrase,
+                status_code=502 if response.status_code >= 500 else response.status_code,
+            )
+        payload = response.json()
+        pages: list[PdfPage] = []
+        ocr_pages: list[PdfOcrPage] = []
+        for entry in payload.get("pages") or []:
+            number = int(entry.get("page") or entry.get("page_number") or 0)
+            native_text = str(entry.get("native_text") or "")
+            ocr_text = str(entry.get("ocr_text") or "")
+            source = str(entry.get("source") or "")
+            pages.append(PdfPage(number=number, native_text=native_text, source=source))
+            if ocr_text:
+                ocr_pages.append(
+                    PdfOcrPage(number=number, ocr_text=ocr_text, interpretation="")
+                )
+        return PdfProcessResult(filename=filename, pages=pages, ocr_pages=ocr_pages)
 
 
 class QwenVisionPdfOcrProvider:
@@ -349,6 +416,7 @@ def build_pdf_evidence(result: PdfProcessResult) -> str:
                 "native_text": page.native_text,
                 "ocr_text": ocr.ocr_text if ocr else "",
                 "interpretation": ocr.interpretation if ocr else "",
+                "source": page.source,
             }
         )
     return json.dumps(
@@ -394,23 +462,38 @@ async def process_pdf_documents(
     renderer: PdfRenderer,
     provider: PdfOcrProvider,
     limiter: PdfWorkLimiter,
+    extract_provider: WorkPdfExtractProvider | None = None,
 ) -> str:
     async with limiter.slot():
         results: list[dict] = []
         for item in items:
             raw, filename = decode_pdf_block(item)
-            result = await asyncio.wait_for(
-                asyncio.to_thread(
-                    prepare_pdf_media,
-                    pdf_bytes=raw,
-                    filename=filename,
-                    settings=settings,
-                    extractor=extractor,
-                    renderer=renderer,
-                    provider=provider,
-                ),
-                timeout=settings.pdf_timeout_seconds,
+            enforce_pdf_limits(
+                pdf_bytes=raw, page_count=0, rendered_pixels=0, settings=settings
             )
+            if extract_provider is not None:
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        extract_provider.extract,
+                        pdf_bytes=raw,
+                        filename=filename,
+                        timeout_seconds=settings.pdf_ocr_timeout_seconds,
+                    ),
+                    timeout=settings.pdf_timeout_seconds,
+                )
+            else:
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        prepare_pdf_media,
+                        pdf_bytes=raw,
+                        filename=filename,
+                        settings=settings,
+                        extractor=extractor,
+                        renderer=renderer,
+                        provider=provider,
+                    ),
+                    timeout=settings.pdf_timeout_seconds,
+                )
             results.append(json.loads(build_pdf_evidence(result))["document"])
         return json.dumps(
             {"documents": results},
